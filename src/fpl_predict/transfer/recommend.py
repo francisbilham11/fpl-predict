@@ -517,6 +517,7 @@ def recommend_weekly_transfers(
         from ..data.fpl_api import get_bootstrap
         bootstrap = get_bootstrap()
         players_map = {p["id"]: p for p in bootstrap["elements"]}
+        teams_map = {t["id"]: t["name"] for t in bootstrap["teams"]}
 
         enhanced_changes = []
         for change in recommended_scenario["changes"]:
@@ -527,46 +528,25 @@ def recommend_weekly_transfers(
                 "in": change["in"],
                 "out_name": p_out.get("web_name", "Unknown"),
                 "in_name": p_in.get("web_name", "Unknown"),
+                "out_team": teams_map.get(p_out.get("team"), ""),
+                "in_team": teams_map.get(p_in.get("team"), ""),
+                "out_pos": ["GKP", "DEF", "MID", "FWD"][p_out["element_type"] - 1] if p_out.get("element_type") else "",
+                "in_pos": ["GKP", "DEF", "MID", "FWD"][p_in["element_type"] - 1] if p_in.get("element_type") else "",
                 "out_price": p_out.get("now_cost", 0),
                 "in_price": p_in.get("now_cost", 0)
             })
 
-        # Build human-readable output with clear transfer section
-        output_lines = []
+        # Extract metadata from full optimization result
+        dead_players = full_result.get("dead_players", [])
+        club_violation_info = full_result.get("club_violation_info", {})
+        removes_dead = full_result.get("removes_dead", False)
+        fixes_club_violation = full_result.get("fixes_club_violation", False)
 
-        # Header with transfer count
-        if recommended_scenario["transfers"] > 0:
-            output_lines.append("=" * 60)
-            output_lines.append(f"RECOMMENDED TRANSFERS: {recommended_scenario['transfers']}")
-            output_lines.append("=" * 60)
-            output_lines.append("")
-
-            # Show transfers clearly
-            for i, change in enumerate(enhanced_changes, 1):
-                out_name = change["out_name"]
-                in_name = change["in_name"]
-                out_price = change["out_price"] / 10
-                in_price = change["in_price"] / 10
-                diff = (change["in_price"] - change["out_price"]) / 10
-                diff_str = f"(+£{diff:.1f}m)" if diff > 0 else f"(£{diff:.1f}m)" if diff < 0 else ""
-
-                output_lines.append(f"{i}. OUT: {out_name} (£{out_price:.1f}m)")
-                output_lines.append(f"   IN:  {in_name} (£{in_price:.1f}m) {diff_str}")
-                output_lines.append("")
-
-            # Show EP gain
-            if ep_gain > 0:
-                output_lines.append(f"Expected points gain: +{ep_gain:.1f} over {planning_horizon} gameweeks")
-            if recommended_scenario["cost"] > 0:
-                output_lines.append(f"Hit cost: -{recommended_scenario['cost']} points")
-                net_gain = ep_gain - recommended_scenario['cost']
-                output_lines.append(f"Net gain: {net_gain:+.1f} points")
-            output_lines.append("")
-
-        # Add the squad/lineup details from optimizer
-        squad_output = full_result.get("human_readable", "")
-        if squad_output:
-            output_lines.append(squad_output)
+        # Resolve club violation team names
+        club_violations_named = {}
+        for team_id, count in club_violation_info.items():
+            team_name = teams_map.get(team_id, f"Team {team_id}")
+            club_violations_named[team_name] = count
 
         # Format recommendation
         recommendation = {
@@ -580,12 +560,20 @@ def recommend_weekly_transfers(
             "planning_horizon": planning_horizon,
             "free_transfers": free_transfers,
             "bank": bank,
+            "team_value": team_value,
             # Add lineup details from the RECOMMENDED scenario, not necessarily the best
             "optimization_result": full_result,
-            "human_readable": "\n".join(output_lines),
-            "banking_analysis": banking_analysis
+            "banking_analysis": banking_analysis,
+            # Metadata for verbose reporting
+            "dead_players": dead_players,
+            "club_violations": club_violations_named,
+            "removes_dead": removes_dead,
+            "fixes_club_violation": fixes_club_violation,
         }
-        
+
+        # Build comprehensive human_readable using the unified formatter
+        recommendation["human_readable"] = format_recommendation_output(recommendation)
+
         return recommendation
     
     return {"error": "Could not generate transfer recommendations"}
@@ -694,122 +682,331 @@ def validate_transfer_quality(
 
 
 def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
-    """Format recommendation for CLI output."""
+    """
+    Comprehensive, verbose formatter for transfer recommendations.
+
+    Produces airtight output covering all scenarios:
+    - FT accounting (available vs used vs carried over)
+    - Squad issues (dead players, club violations)
+    - Transfer details with reasoning
+    - Lineup
+    - Banking analysis
+    - Scenario comparison
+    """
     from ..data.fpl_api import get_bootstrap
-    
-    # Get player names
+
     bootstrap = get_bootstrap()
     players_map = {p["id"]: p for p in bootstrap["elements"]}
     teams_map = {t["id"]: t["name"] for t in bootstrap["teams"]}
-    
+
     output = []
-    output.append("=" * 60)
-    output.append("TRANSFER RECOMMENDATIONS")
-    output.append("=" * 60)
-    
+
     if recommendation.get("error"):
+        output.append("=" * 60)
+        output.append("TRANSFER RECOMMENDATION")
+        output.append("=" * 60)
         output.append(f"Error: {recommendation['error']}")
         return "\n".join(output)
-    
-    # Summary
+
+    # --- Extract all data ---
     rec_transfers = recommendation["recommended_transfers"]
-    expected_gain = recommendation["expected_gain"]
-    cost = recommendation["transfer_cost"]
+    expected_gain = recommendation.get("expected_gain", 0)
+    cost = recommendation.get("transfer_cost", 0)
     horizon = recommendation.get("planning_horizon", 5)
     free_transfers = recommendation.get("free_transfers", 1)
     bank = recommendation.get("bank", 0)
-    
-    output.append(f"\nFree transfers available: {free_transfers}")
-    output.append(f"Bank: £{bank:.1f}m")
-    
-    if rec_transfers == 0:
-        output.append(f"\n✅ HOLD - No transfers recommended")
-        output.append(f"Your current team is well-optimized for the next {horizon} gameweeks.")
+    team_value = recommendation.get("team_value", 0)
+    changes = recommendation.get("changes", [])
+    dead_players = recommendation.get("dead_players", [])
+    club_violations = recommendation.get("club_violations", {})
+    removes_dead = recommendation.get("removes_dead", False)
+    fixes_club_violation = recommendation.get("fixes_club_violation", False)
+    banking_analysis = recommendation.get("banking_analysis")
+    is_banking = (banking_analysis and banking_analysis.get("decision", {}).get("should_bank", False))
+    full_result = recommendation.get("optimization_result", {})
+
+    # --- HEADER ---
+    output.append("=" * 60)
+    output.append("FPL TRANSFER RECOMMENDATION")
+    output.append("=" * 60)
+
+    # --- SQUAD STATUS ---
+    output.append("")
+    output.append("SQUAD STATUS")
+    output.append("-" * 40)
+    output.append(f"  Free transfers available: {free_transfers}")
+    output.append(f"  Bank: £{bank:.1f}m")
+    if team_value:
+        output.append(f"  Team value: £{team_value:.1f}m")
+    output.append(f"  Planning horizon: {horizon} gameweeks")
+
+    # Dead players
+    if dead_players:
+        dead_names = ", ".join(f"{dp['name']} ({dp['pos']})" for dp in dead_players)
+        output.append(f"  Dead players: {len(dead_players)} — {dead_names}")
     else:
-        output.append(f"\n📊 Recommended: {rec_transfers} transfer{'s' if rec_transfers > 1 else ''}")
-        if cost > 0:
-            output.append(f"Hit cost: -{cost} points")
-        # Show net gain after accounting for hit cost
-        net_gain = expected_gain - cost
-        if net_gain > 0:
-            output.append(f"Expected net gain over next {horizon} GWs: +{net_gain:.1f} points")
-        else:
-            output.append(f"Expected net gain over next {horizon} GWs: {net_gain:.1f} points")
-        
-        # Show specific transfers
-        output.append("\n" + "-" * 40)
-        output.append("TRANSFERS:")
-        for change in recommendation["changes"]:
-            p_out = players_map.get(change["out"], {})
-            p_in = players_map.get(change["in"], {})
-            
-            out_name = p_out.get("web_name", f"Player {change['out']}")
-            out_team = teams_map.get(p_out.get("team"), "")
-            in_name = p_in.get("web_name", f"Player {change['in']}")
-            in_team = teams_map.get(p_in.get("team"), "")
-            
-            output.append(f"OUT: {out_name} ({out_team})")
-            output.append(f" IN: {in_name} ({in_team})")
-            output.append("")
-    
-    # Show proposed lineup
-    if "human_readable" in recommendation and recommendation["human_readable"]:
-        hr = recommendation["human_readable"]
-        if "OPTIMAL LINEUP" in hr:
-            output.append("\n" + "-" * 40)
-            # Show appropriate title based on recommendation
-            if recommendation["recommended_transfers"] == 0:
-                # Check if this is due to banking
-                if "banking_analysis" in recommendation and recommendation["banking_analysis"]:
-                    if recommendation["banking_analysis"].get("decision", {}).get("should_bank", False):
-                        output.append("CURRENT LINEUP (BANKING TRANSFER):")
-                    else:
-                        output.append("CURRENT LINEUP (OPTIMIZED):")
-                else:
-                    output.append("CURRENT LINEUP (OPTIMIZED):")
+        output.append(f"  Dead players: 0")
+
+    # Club violations
+    if club_violations:
+        for team_name, count in club_violations.items():
+            output.append(f"  Club violation: {count} players from {team_name} (max {3})")
+    else:
+        output.append(f"  Club violations: None")
+
+    # --- TRANSFER DECISION ---
+    output.append("")
+    output.append("TRANSFER DECISION")
+    output.append("-" * 40)
+
+    if is_banking:
+        # Banking recommended — using 0 transfers
+        next_ft = banking_analysis.get("next_week_free_transfers", min(free_transfers + 1, 5))
+        output.append(f"  Action: BANK (save transfers)")
+        output.append(f"  Free transfers used: 0 of {free_transfers}")
+        output.append(f"  Free transfers next GW: {next_ft}")
+        reasoning = banking_analysis.get("decision", {}).get("reasoning", "")
+        if reasoning:
+            output.append(f"  Reasoning: {reasoning}")
+
+    elif rec_transfers == 0:
+        # Hold — no beneficial transfers found
+        output.append(f"  Action: HOLD (no transfers)")
+        output.append(f"  Free transfers used: 0 of {free_transfers}")
+        unused = free_transfers
+        next_ft = min(free_transfers + 1, 5)
+        if unused > 0:
+            output.append(f"  Unused free transfers: {unused} (carry over → {next_ft} FT next GW)")
+        output.append(f"  Reasoning: Current squad is well-optimized for the next {horizon} gameweeks")
+
+    else:
+        # Making transfers
+        free_used = min(rec_transfers, free_transfers)
+        hits_taken = max(0, rec_transfers - free_transfers)
+        unused_ft = free_transfers - free_used
+        next_ft = min(unused_ft + 1, 5)
+
+        output.append(f"  Action: TRANSFER")
+        output.append(f"  Free transfers used: {free_used} of {free_transfers}")
+        if unused_ft > 0:
+            output.append(f"  Unused free transfers: {unused_ft} (carry over → {next_ft} FT next GW)")
+        elif unused_ft == 0 and hits_taken == 0:
+            output.append(f"  All free transfers used → {next_ft} FT next GW")
+        if hits_taken > 0:
+            output.append(f"  Additional transfers (hits): {hits_taken} × -4 = -{hits_taken * 4} pts")
+
+        # Transfer reasoning tags
+        reasons = []
+        if fixes_club_violation:
+            reasons.append("Fixes club limit violation")
+        if removes_dead:
+            reasons.append("Removes dead player from squad")
+        if not fixes_club_violation and not removes_dead and expected_gain > 0:
+            reasons.append(f"Best available EP improvement (+{expected_gain:.1f} over {horizon} GWs)")
+        if reasons:
+            output.append(f"  Reasoning: {'; '.join(reasons)}")
+
+    # --- TRANSFERS ---
+    if rec_transfers > 0 and changes:
+        output.append("")
+        output.append(f"TRANSFERS ({rec_transfers})")
+        output.append("-" * 40)
+
+        for i, change in enumerate(changes, 1):
+            out_name = change.get("out_name", "Unknown")
+            in_name = change.get("in_name", "Unknown")
+            out_team = change.get("out_team", "")
+            in_team = change.get("in_team", "")
+            out_pos = change.get("out_pos", "")
+            in_pos = change.get("in_pos", "")
+            out_price = change.get("out_price", 0) / 10
+            in_price = change.get("in_price", 0) / 10
+            price_diff = in_price - out_price
+
+            if rec_transfers > 1:
+                output.append(f"  Transfer {i}:")
+                prefix = "    "
             else:
-                output.append("PROPOSED LINEUP AFTER TRANSFERS:")
-            
-            # Extract the lineup section from human_readable
-            lines = hr.split('\n')
-            in_lineup = False
-            lineup_lines = []
-            
-            for line in lines:
-                if "OPTIMAL LINEUP" in line:
-                    in_lineup = True
-                    lineup_lines.append(line.replace("=== ", "").replace(" ===", ""))
-                elif in_lineup:
-                    lineup_lines.append(line)
-                    if "Vice-Captain:" in line:
-                        break
-            
-            # Add the lineup to output
-            for line in lineup_lines:
-                output.append(line)
-    
-    # Banking decision (if evaluated)
-    if "banking_analysis" in recommendation and recommendation["banking_analysis"]:
-        banking_info = recommendation["banking_analysis"]
-        if "decision" in banking_info:
-            decision = banking_info["decision"]
-            output.append("\n" + "-" * 40)
-            output.append("BANKING ANALYSIS:")
-            output.append(decision.get("formatted", "Banking analysis not available"))
-    
-    # Scenario comparison
-    output.append("\n" + "-" * 40)
-    output.append(f"SCENARIO ANALYSIS (cumulative over {horizon} GWs):")
-    for scenario in recommendation["scenarios"]:
-        transfers = scenario["transfers"]
-        net_pts = scenario["net_points"]
-        cost = scenario["cost"]
-        
-        if transfers == 0:
-            output.append(f"Hold (0 transfers): {net_pts:.1f} pts")
+                prefix = "  "
+
+            output.append(f"{prefix}OUT: {out_name} ({out_pos}, {out_team}) — £{out_price:.1f}m")
+            output.append(f"{prefix}IN:  {in_name} ({in_pos}, {in_team}) — £{in_price:.1f}m")
+
+            # Price difference
+            if price_diff > 0:
+                output.append(f"{prefix}Cost: +£{price_diff:.1f}m")
+            elif price_diff < 0:
+                output.append(f"{prefix}Savings: £{abs(price_diff):.1f}m")
+            else:
+                output.append(f"{prefix}Cost: £0.0m (like-for-like price)")
+
+            # Per-transfer annotations
+            annotations = []
+            out_id = change.get("out")
+            if dead_players and out_id in [dp["id"] for dp in dead_players]:
+                annotations.append("Removes dead player")
+            if club_violations:
+                # Check if this transfer fixes a club violation
+                p_out_data = players_map.get(out_id, {})
+                out_team_name = teams_map.get(p_out_data.get("team"), "")
+                if out_team_name in club_violations:
+                    in_id = change.get("in")
+                    p_in_data = players_map.get(in_id, {})
+                    in_team_name = teams_map.get(p_in_data.get("team"), "")
+                    if in_team_name != out_team_name:
+                        annotations.append(f"Fixes {out_team_name} club violation")
+            if annotations:
+                output.append(f"{prefix}Note: {'; '.join(annotations)}")
+
+            if i < len(changes):
+                output.append("")
+
+        # EP summary
+        output.append("")
+        if expected_gain > 0:
+            output.append(f"  Expected points gain: +{expected_gain:.1f} over {horizon} GWs ({expected_gain/horizon:.2f}/wk)")
+        elif expected_gain == 0:
+            output.append(f"  Expected points gain: 0.0 (transfer addresses squad constraint, not EP)")
         else:
-            output.append(f"{transfers} transfer{'s' if transfers > 1 else ''}: {net_pts:.1f} pts" + 
-                         (f" (after -{cost} hit)" if cost > 0 else ""))
-    
+            output.append(f"  Expected points gain: {expected_gain:.1f} over {horizon} GWs")
+        if cost > 0:
+            net_gain = expected_gain - cost
+            output.append(f"  Hit cost: -{cost} pts")
+            output.append(f"  Net gain after hits: {net_gain:+.1f} pts")
+
+    # --- REMAINING ISSUES (after transfers are applied) ---
+    remaining_dead = len(dead_players)
+    if rec_transfers > 0 and removes_dead:
+        # Count how many dead players are actually removed by the transfers
+        removed_ids = {c.get("out") for c in changes}
+        dead_ids = {dp["id"] for dp in dead_players}
+        dead_removed = len(removed_ids & dead_ids)
+        remaining_dead = len(dead_players) - dead_removed
+
+    remaining_violations = {}
+    if club_violations:
+        for team_name, count in club_violations.items():
+            # Check if any transfer removes a player from this team
+            reduced = 0
+            if rec_transfers > 0:
+                for c in changes:
+                    p_out_data = players_map.get(c.get("out"), {})
+                    out_team_name = teams_map.get(p_out_data.get("team"), "")
+                    p_in_data = players_map.get(c.get("in"), {})
+                    in_team_name = teams_map.get(p_in_data.get("team"), "")
+                    if out_team_name == team_name and in_team_name != team_name:
+                        reduced += 1
+            new_count = count - reduced
+            if new_count > 3:
+                remaining_violations[team_name] = new_count
+
+    if remaining_dead > 0 or remaining_violations:
+        output.append("")
+        output.append("REMAINING SQUAD ISSUES")
+        output.append("-" * 40)
+        if remaining_dead > 0:
+            # List remaining dead players
+            removed_ids = {c.get("out") for c in changes} if rec_transfers > 0 else set()
+            remaining_dead_players = [dp for dp in dead_players if dp["id"] not in removed_ids]
+            names = ", ".join(f"{dp['name']} ({dp['pos']})" for dp in remaining_dead_players)
+            output.append(f"  Dead players still in squad: {remaining_dead} — {names}")
+            output.append(f"  Consider addressing these in future transfer windows")
+        for team_name, count in remaining_violations.items():
+            output.append(f"  Club violation persists: {count} players from {team_name}")
+
+    # --- LINEUP ---
+    hr = full_result.get("human_readable", "")
+    if hr and "OPTIMAL LINEUP" in hr:
+        output.append("")
+        if is_banking:
+            output.append("CURRENT LINEUP (BANKING — NO CHANGES)")
+        elif rec_transfers == 0:
+            output.append("CURRENT LINEUP (OPTIMIZED)")
+        else:
+            output.append("LINEUP AFTER TRANSFERS")
+        output.append("-" * 40)
+
+        # Extract lineup section from optimizer output
+        lines = hr.split('\n')
+        in_lineup = False
+        for line in lines:
+            if "OPTIMAL LINEUP" in line:
+                in_lineup = True
+                # Use the formation info but skip the "===" wrapper
+                output.append(line.replace("=== ", "  ").replace(" ===", ""))
+            elif in_lineup:
+                output.append(line)
+                if "Vice-Captain:" in line:
+                    break
+
+    # --- BANKING ANALYSIS ---
+    if banking_analysis and "decision" in banking_analysis:
+        decision = banking_analysis["decision"]
+        comparison = banking_analysis.get("comparison", {})
+        current_ft = banking_analysis.get("current_free_transfers", free_transfers)
+        next_ft = banking_analysis.get("next_week_free_transfers", min(free_transfers + 1, 5))
+
+        output.append("")
+        output.append("BANKING ANALYSIS")
+        output.append("-" * 40)
+
+        best_now = comparison.get("best_now", 0)
+        bank_for_next = comparison.get("bank_for_next", 0)
+        advantage = comparison.get("banking_advantage", 0)
+
+        output.append(f"  Best option with {current_ft} FT now:    {best_now:+.2f} EP gain")
+        output.append(f"  Banking for {next_ft} FT next week:  {bank_for_next:+.2f} EP gain")
+        output.append(f"  Banking advantage:              {advantage:+.2f} EP")
+
+        # Show what the banked transfers would be
+        banked_changes = banking_analysis.get("banked_changes", [])
+        if banked_changes:
+            output.append(f"  If banking, best {next_ft}-transfer combo next GW:")
+            for bc in banked_changes:
+                output.append(f"    {bc.get('out_name', '?')} → {bc.get('in_name', '?')}")
+
+        if banking_analysis.get("overlapping_transfer"):
+            output.append(f"  Note: Best single transfer is part of the banked combo")
+
+        # Final verdict
+        if decision.get("should_bank"):
+            output.append(f"  Verdict: BANK your transfer → {next_ft} FT next GW")
+        else:
+            output.append(f"  Verdict: USE your {current_ft} FT now")
+
+        reasoning = decision.get("reasoning", "")
+        if reasoning:
+            output.append(f"  Reasoning: {reasoning}")
+
+    # --- SCENARIO ANALYSIS ---
+    scenarios = recommendation.get("scenarios", [])
+    if scenarios:
+        output.append("")
+        output.append(f"SCENARIO COMPARISON (over {horizon} GWs)")
+        output.append("-" * 40)
+
+        # Find baseline for relative comparison
+        baseline_pts = 0
+        for s in scenarios:
+            if s["transfers"] == 0:
+                baseline_pts = s["net_points"]
+                break
+
+        for scenario in scenarios:
+            transfers = scenario["transfers"]
+            net_pts = scenario["net_points"]
+            s_cost = scenario["cost"]
+            diff = net_pts - baseline_pts
+
+            if transfers == 0:
+                marker = " <--" if rec_transfers == 0 else ""
+                output.append(f"  Hold (0 transfers): {net_pts:.1f} pts (baseline){marker}")
+            else:
+                hit_note = f" (after -{s_cost} hit)" if s_cost > 0 else ""
+                diff_str = f" ({diff:+.1f} vs hold)"
+                marker = " <-- RECOMMENDED" if transfers == rec_transfers and s_cost == cost else ""
+                output.append(f"  {transfers} transfer{'s' if transfers > 1 else ''}: {net_pts:.1f} pts{diff_str}{hit_note}{marker}")
+
+    output.append("")
     output.append("=" * 60)
     return "\n".join(output)

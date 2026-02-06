@@ -162,67 +162,13 @@ def transfers_recommend(entry: int | None, max_transfers: int, horizon: int, con
             evaluate_banking=not no_banking  # Enable banking by default
         )
         
-        # Use the human_readable output if available, otherwise fall back to old format
+        # The recommendation dict always has human_readable from format_recommendation_output
         if "human_readable" in recommendation and recommendation["human_readable"]:
             click.echo(recommendation["human_readable"])
-            
-            # Add banking comparison if available
-            if "banking_analysis" in recommendation and recommendation["banking_analysis"]:
-                ba = recommendation["banking_analysis"]
-                current_ft = ba.get('current_free_transfers', 1)
-                next_ft = ba.get('next_week_free_transfers', 2)
-                
-                click.echo("\n" + "=" * 60)
-                click.echo("BANKING STRATEGY COMPARISON")
-                click.echo("=" * 60)
-                
-                # Handle both old and new comparison keys for backwards compatibility
-                best_now = ba['comparison'].get('best_now', ba['comparison'].get('one_transfer_now', 0))
-                bank_for_next = ba['comparison'].get('bank_for_next', ba['comparison'].get('bank_for_two', 0))
-                
-                click.echo(f"Best option with {current_ft} FT now: {best_now:.2f} EP gain")
-                click.echo(f"Banking for {next_ft} FT next week: {bank_for_next:.2f} EP gain")
-                
-                # Handle both old and new change formats
-                changes = ba.get('banked_changes', ba.get('two_transfer_changes', []))
-                if changes:
-                    click.echo(f"\nBest {next_ft}-transfer option if banking:")
-                    for change in changes:
-                        click.echo(f"  {change['out_name']} -> {change['in_name']}")
-                
-                if ba.get('overlapping_transfer'):
-                    click.echo("\n⚠️  Note: The best transfer is part of the banked combination")
-                    click.echo("   You can make it now and still do additional transfers next week")
-                
-                click.echo(f"\nBanking advantage: {ba['comparison']['banking_advantage']:+.2f} EP")
-                
-                # Use the smart decision logic if available
-                if 'decision' in ba:
-                    decision = ba['decision']
-                    if decision.get('should_bank'):
-                        click.echo(f"\n✓ Recommendation: Bank your transfer for {next_ft} FT next week")
-                    else:
-                        click.echo(f"\n✓ Recommendation: Use your {current_ft} FT now")
-                    
-                    # Show reasoning if available
-                    if decision.get('reasoning'):
-                        click.echo(f"   Reasoning: {decision['reasoning']}")
-                    
-                    if ba.get('overlapping_transfer') and not decision.get('should_bank'):
-                        click.echo("   You'll get the benefit immediately and maintain flexibility")
-                else:
-                    # Fall back to simple comparison if smart logic not available
-                    if ba['comparison']['banking_advantage'] > 0:
-                        click.echo(f"\n✓ Recommendation: Bank your transfer for {next_ft} FT next week")
-                    else:
-                        click.echo(f"\n✓ Recommendation: Use your {current_ft} FT now")
-                        if ba.get('overlapping_transfer'):
-                            click.echo("   You'll get the benefit immediately and maintain flexibility")
+        elif "error" in recommendation:
+            click.echo(f"Error: {recommendation['error']}")
         else:
-            # Fall back to old format
-            from .transfer.recommend import format_recommendation_output
-            output = format_recommendation_output(recommendation)
-            click.echo(output)
+            click.echo("No recommendation could be generated.")
         
     except FileNotFoundError as e:
         click.echo(f"Error: {e}")

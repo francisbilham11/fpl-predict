@@ -35,11 +35,44 @@ def evaluate_banking_decision(
         'unavailable_players': 0,
         'low_ep_players': 0,
         'cant_field_xi': False,
+        'club_violation': False,
+        'club_violation_team': None,
         'banking_advantage': banking_advantage,
         'urgency_score': 0,
         'dead_players': []
     }
-    
+
+    # Check for club limit violations (max 3 per team)
+    bootstrap = None
+    teams_map = {}
+    players_map = {}
+    try:
+        from ..data.fpl_api import get_bootstrap
+        bootstrap = get_bootstrap()
+        players_map = {p['id']: p for p in bootstrap['elements']}
+        teams_map = {t['id']: t['name'] for t in bootstrap['teams']}
+
+        team_counts = {}
+        for player in current_squad:
+            if isinstance(player, dict):
+                player_id = player.get('element') or player.get('id')
+            else:
+                player_id = player
+            p = players_map.get(player_id, {})
+            team_id = p.get('team')
+            if team_id:
+                team_counts[team_id] = team_counts.get(team_id, 0) + 1
+
+        for team_id, count in team_counts.items():
+            if count > 3:
+                metrics['club_violation'] = True
+                metrics['club_violation_team'] = teams_map.get(team_id, f"Team {team_id}")
+                metrics['club_violation_count'] = count
+                log.warning(f"🚨 Club violation: {count} players from {metrics['club_violation_team']}")
+                break
+    except Exception as e:
+        log.debug(f"Could not check club violations: {e}")
+
     # Check for unavailable/injured players
     for player in current_squad:
         # Handle both dict and int formats
@@ -72,12 +105,17 @@ def evaluate_banking_decision(
     # Decision logic
     reasoning = []
     should_bank = False
-    
+
+    # RULE 0: If club limit violation, MUST transfer now - this is a rule violation
+    if metrics['club_violation']:
+        should_bank = False
+        reasoning.append(f"🚨 CRITICAL: {metrics.get('club_violation_count', 4)} players from {metrics['club_violation_team']} - must transfer one out")
+
     # RULE 1: If you can't field XI, must transfer now
-    if metrics['cant_field_xi']:
+    elif metrics['cant_field_xi']:
         should_bank = False
         reasoning.append("CRITICAL: Cannot field 11 players - must transfer now")
-        
+
     # RULE 2: If 2+ unavailable players, strongly prefer transferring now
     elif metrics['unavailable_players'] >= 2:
         should_bank = False
@@ -114,16 +152,38 @@ def evaluate_banking_decision(
     if metrics['low_ep_players'] > 2:
         reasoning.append(f"Note: {metrics['low_ep_players']} players with very low EP")
     
-    # Check if current best transfer would fix a dead player
+    # Check if current best transfer would fix issues
     removes_dead = False
+    fixes_club_violation = False
     if not should_bank and current_changes:
+        # Get player team info for club violation check
+        violation_team_players = set()
+        if metrics['club_violation'] and players_map:
+            for pid, p in players_map.items():
+                team_name = teams_map.get(p.get('team'))
+                if team_name == metrics['club_violation_team']:
+                    violation_team_players.add(pid)
+
         for change in current_changes:
+            # Check for dead player removal
             if change.get('out') in metrics['dead_players']:
                 reasoning.append(f"✓ Removes dead player ID {change['out']}")
                 removes_dead = True
 
+            # Check for club violation fix - if transferring out a player from the violating team
+            out_id = change.get('out')
+            if out_id and out_id in violation_team_players:
+                fixes_club_violation = True
+
+        if fixes_club_violation:
+            reasoning.append(f"✓ Fixes club limit violation")
+
+        # If we have a club violation but aren't fixing it, this is a problem
+        if metrics['club_violation'] and not fixes_club_violation:
+            reasoning.append(f"⚠️ WARNING: Transfer does not fix club violation!")
+
         # If we have dead players but aren't removing one, explain why
-        if metrics['unavailable_players'] > 0 and not removes_dead:
+        if metrics['unavailable_players'] > 0 and not removes_dead and not metrics['club_violation']:
             reasoning.append(f"Note: {metrics['unavailable_players']} dead player(s) on bench, but best value transfer upgrades starting XI")
 
     # Final reasoning string
