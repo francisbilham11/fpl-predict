@@ -536,17 +536,81 @@ def recommend_weekly_transfers(
                 "in_price": p_in.get("now_cost", 0)
             })
 
-        # Extract metadata from full optimization result
-        dead_players = full_result.get("dead_players", [])
-        club_violation_info = full_result.get("club_violation_info", {})
-        removes_dead = full_result.get("removes_dead", False)
-        fixes_club_violation = full_result.get("fixes_club_violation", False)
+        # Compute squad issues directly from current squad + data
+        # (Don't rely on optimizer metadata — not all paths return it)
+        from ..utils.io import read_parquet
 
-        # Resolve club violation team names
+        try:
+            _ep_df = read_parquet(Path("data/processed/exp_points.parquet"))
+            _xmins_df = read_parquet(Path("data/processed/xmins.parquet"))
+            _ep_map = dict(zip(_ep_df['player_id'], _ep_df['ep_adjusted']))
+            _xmins_map = dict(zip(_xmins_df['player_id'], _xmins_df['xmins']))
+        except Exception:
+            log.warning("Could not load predictions for squad issue detection")
+            _ep_map = {}
+            _xmins_map = {}
+
+        LOW_XMINS_THRESHOLD = 15  # minutes — below this is effectively dead
+
+        squad_issues = []  # list of {id, name, pos, team, category, detail}
+        for pid in current_squad:
+            p_data = players_map.get(pid, {})
+            if not p_data:
+                continue
+            name = p_data.get("web_name", "Unknown")
+            pos = ["GKP", "DEF", "MID", "FWD"][p_data.get("element_type", 1) - 1]
+            team_name = teams_map.get(p_data.get("team"), "")
+            status = p_data.get("status", "a")
+            chance = p_data.get("chance_of_playing_this_round")
+            news = (p_data.get("news") or "").lower()
+            xmins = _xmins_map.get(pid, 45.0)
+            ep_adj = _ep_map.get(pid, float(p_data.get("ep_next", 1)))
+
+            if status in ('i', 's', 'u', 'n') and (chance == 0 or chance is None or 'unknown return' in news):
+                squad_issues.append({
+                    "id": pid, "name": name, "pos": pos, "team": team_name,
+                    "category": "red_flagged",
+                    "detail": f"status={status}, chance={chance}"
+                })
+            elif status == 'd' or (chance is not None and 0 < chance < 75):
+                squad_issues.append({
+                    "id": pid, "name": name, "pos": pos, "team": team_name,
+                    "category": "yellow_flagged",
+                    "detail": f"status={status}, chance={chance}%"
+                })
+            elif xmins < LOW_XMINS_THRESHOLD and ep_adj < 1.0:
+                squad_issues.append({
+                    "id": pid, "name": name, "pos": pos, "team": team_name,
+                    "category": "low_xmins",
+                    "detail": f"xMins={xmins:.1f}, EP={ep_adj:.2f}"
+                })
+
+        # Club violations — computed from current squad
         club_violations_named = {}
-        for team_id, count in club_violation_info.items():
-            team_name = teams_map.get(team_id, f"Team {team_id}")
-            club_violations_named[team_name] = count
+        _team_counts = {}
+        for pid in current_squad:
+            p_data = players_map.get(pid, {})
+            tid = p_data.get("team")
+            if tid:
+                _team_counts[tid] = _team_counts.get(tid, 0) + 1
+        for tid, cnt in _team_counts.items():
+            if cnt > 3:
+                club_violations_named[teams_map.get(tid, f"Team {tid}")] = cnt
+
+        # Determine if the recommended transfers fix issues
+        transferred_out_ids = {c.get("out") for c in enhanced_changes}
+        issue_ids = {si["id"] for si in squad_issues}
+        removes_dead = bool(transferred_out_ids & issue_ids)
+
+        fixes_club_violation = False
+        if club_violations_named and enhanced_changes:
+            for c in enhanced_changes:
+                p_out_data = players_map.get(c.get("out"), {})
+                p_in_data = players_map.get(c.get("in"), {})
+                out_team = teams_map.get(p_out_data.get("team"), "")
+                in_team = teams_map.get(p_in_data.get("team"), "")
+                if out_team in club_violations_named and in_team != out_team:
+                    fixes_club_violation = True
 
         # Format recommendation
         recommendation = {
@@ -564,8 +628,8 @@ def recommend_weekly_transfers(
             # Add lineup details from the RECOMMENDED scenario, not necessarily the best
             "optimization_result": full_result,
             "banking_analysis": banking_analysis,
-            # Metadata for verbose reporting
-            "dead_players": dead_players,
+            # Metadata for verbose reporting (computed directly from current squad)
+            "squad_issues": squad_issues,
             "club_violations": club_violations_named,
             "removes_dead": removes_dead,
             "fixes_club_violation": fixes_club_violation,
@@ -717,7 +781,7 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
     bank = recommendation.get("bank", 0)
     team_value = recommendation.get("team_value", 0)
     changes = recommendation.get("changes", [])
-    dead_players = recommendation.get("dead_players", [])
+    squad_issues = recommendation.get("squad_issues", [])
     club_violations = recommendation.get("club_violations", {})
     removes_dead = recommendation.get("removes_dead", False)
     fixes_club_violation = recommendation.get("fixes_club_violation", False)
@@ -740,17 +804,27 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
         output.append(f"  Team value: £{team_value:.1f}m")
     output.append(f"  Planning horizon: {horizon} gameweeks")
 
-    # Dead players
-    if dead_players:
-        dead_names = ", ".join(f"{dp['name']} ({dp['pos']})" for dp in dead_players)
-        output.append(f"  Dead players: {len(dead_players)} — {dead_names}")
-    else:
-        output.append(f"  Dead players: 0")
+    # Squad issues by category
+    red_flagged = [si for si in squad_issues if si["category"] == "red_flagged"]
+    yellow_flagged = [si for si in squad_issues if si["category"] == "yellow_flagged"]
+    low_xmins = [si for si in squad_issues if si["category"] == "low_xmins"]
+
+    if red_flagged:
+        names = ", ".join(f"{si['name']} ({si['pos']})" for si in red_flagged)
+        output.append(f"  Red-flagged: {len(red_flagged)} — {names}")
+    if yellow_flagged:
+        names = ", ".join(f"{si['name']} ({si['pos']})" for si in yellow_flagged)
+        output.append(f"  Yellow-flagged: {len(yellow_flagged)} — {names}")
+    if low_xmins:
+        names = ", ".join(f"{si['name']} ({si['pos']}, {si['detail']})" for si in low_xmins)
+        output.append(f"  Low xMins: {len(low_xmins)} — {names}")
+    if not squad_issues:
+        output.append(f"  Player issues: None")
 
     # Club violations
     if club_violations:
         for team_name, count in club_violations.items():
-            output.append(f"  Club violation: {count} players from {team_name} (max {3})")
+            output.append(f"  Club violation: {count} players from {team_name} (max 3)")
     else:
         output.append(f"  Club violations: None")
 
@@ -800,7 +874,7 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
         if fixes_club_violation:
             reasons.append("Fixes club limit violation")
         if removes_dead:
-            reasons.append("Removes dead player from squad")
+            reasons.append("Removes flagged/low-xMins player from squad")
         if not fixes_club_violation and not removes_dead and expected_gain > 0:
             reasons.append(f"Best available EP improvement (+{expected_gain:.1f} over {horizon} GWs)")
         if reasons:
@@ -843,8 +917,10 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
             # Per-transfer annotations
             annotations = []
             out_id = change.get("out")
-            if dead_players and out_id in [dp["id"] for dp in dead_players]:
-                annotations.append("Removes dead player")
+            issue_match = next((si for si in squad_issues if si["id"] == out_id), None)
+            if issue_match:
+                cat_labels = {"red_flagged": "red-flagged", "yellow_flagged": "yellow-flagged", "low_xmins": "low xMins"}
+                annotations.append(f"Removes {cat_labels.get(issue_match['category'], 'flagged')} player")
             if club_violations:
                 # Check if this transfer fixes a club violation
                 p_out_data = players_map.get(out_id, {})
@@ -875,18 +951,12 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
             output.append(f"  Net gain after hits: {net_gain:+.1f} pts")
 
     # --- REMAINING ISSUES (after transfers are applied) ---
-    remaining_dead = len(dead_players)
-    if rec_transfers > 0 and removes_dead:
-        # Count how many dead players are actually removed by the transfers
-        removed_ids = {c.get("out") for c in changes}
-        dead_ids = {dp["id"] for dp in dead_players}
-        dead_removed = len(removed_ids & dead_ids)
-        remaining_dead = len(dead_players) - dead_removed
+    removed_ids = {c.get("out") for c in changes} if rec_transfers > 0 else set()
+    remaining_issues = [si for si in squad_issues if si["id"] not in removed_ids]
 
     remaining_violations = {}
     if club_violations:
         for team_name, count in club_violations.items():
-            # Check if any transfer removes a player from this team
             reduced = 0
             if rec_transfers > 0:
                 for c in changes:
@@ -900,23 +970,31 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
             if new_count > 3:
                 remaining_violations[team_name] = new_count
 
-    if remaining_dead > 0 or remaining_violations:
+    if remaining_issues or remaining_violations:
         output.append("")
         output.append("REMAINING SQUAD ISSUES")
         output.append("-" * 40)
-        if remaining_dead > 0:
-            # List remaining dead players
-            removed_ids = {c.get("out") for c in changes} if rec_transfers > 0 else set()
-            remaining_dead_players = [dp for dp in dead_players if dp["id"] not in removed_ids]
-            names = ", ".join(f"{dp['name']} ({dp['pos']})" for dp in remaining_dead_players)
-            output.append(f"  Dead players still in squad: {remaining_dead} — {names}")
+        rem_red = [si for si in remaining_issues if si["category"] == "red_flagged"]
+        rem_yellow = [si for si in remaining_issues if si["category"] == "yellow_flagged"]
+        rem_low = [si for si in remaining_issues if si["category"] == "low_xmins"]
+        if rem_red:
+            names = ", ".join(f"{si['name']} ({si['pos']})" for si in rem_red)
+            output.append(f"  Red-flagged: {len(rem_red)} — {names}")
+        if rem_yellow:
+            names = ", ".join(f"{si['name']} ({si['pos']})" for si in rem_yellow)
+            output.append(f"  Yellow-flagged: {len(rem_yellow)} — {names}")
+        if rem_low:
+            names = ", ".join(f"{si['name']} ({si['pos']})" for si in rem_low)
+            output.append(f"  Low xMins: {len(rem_low)} — {names}")
+        if remaining_issues:
             output.append(f"  Consider addressing these in future transfer windows")
         for team_name, count in remaining_violations.items():
             output.append(f"  Club violation persists: {count} players from {team_name}")
 
-    # --- LINEUP ---
-    hr = full_result.get("human_readable", "")
-    if hr and "OPTIMAL LINEUP" in hr:
+    # --- LINEUP (built from structured squad data) ---
+    squad_data = full_result.get("squad", [])
+    formation = full_result.get("formation", "")
+    if squad_data:
         output.append("")
         if is_banking:
             output.append("CURRENT LINEUP (BANKING — NO CHANGES)")
@@ -926,18 +1004,71 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
             output.append("LINEUP AFTER TRANSFERS")
         output.append("-" * 40)
 
-        # Extract lineup section from optimizer output
-        lines = hr.split('\n')
-        in_lineup = False
-        for line in lines:
-            if "OPTIMAL LINEUP" in line:
-                in_lineup = True
-                # Use the formation info but skip the "===" wrapper
-                output.append(line.replace("=== ", "  ").replace(" ===", ""))
-            elif in_lineup:
-                output.append(line)
-                if "Vice-Captain:" in line:
-                    break
+        if formation:
+            output.append(f"  Formation: {formation}")
+
+        # Separate XI and bench — handle both dict and object formats
+        xi = []
+        bench = []
+        captain = None
+        vice_captain = None
+        for p in squad_data:
+            # Normalise: some paths return dicts, some return Player objects
+            if isinstance(p, dict):
+                pid = p.get("id")
+                name = p.get("name", "Unknown")
+                pos = p.get("pos") or p.get("position", "")
+                ep = p.get("ep1") or p.get("ep", 0)
+                in_xi = p.get("in_xi", True)
+                is_cap = p.get("is_captain", False)
+                is_vc = p.get("is_vice", False)
+            else:
+                pid = p.id
+                name = p.name
+                pos = p.pos
+                ep = p.ep1
+                in_xi = True  # If not dict, assume XI (fallback)
+                is_cap = False
+                is_vc = False
+
+            entry = {"id": pid, "name": name, "pos": pos, "ep": float(ep or 0)}
+            if in_xi:
+                xi.append(entry)
+            else:
+                bench.append(entry)
+            if is_cap:
+                captain = entry
+            if is_vc:
+                vice_captain = entry
+
+        # If captain not marked, pick highest EP in XI
+        if not captain and xi:
+            captain = max(xi, key=lambda x: x["ep"])
+        # If vice not marked, pick second highest EP in XI
+        if not vice_captain and xi:
+            vice_captain = max((p for p in xi if p["id"] != captain["id"]), key=lambda x: x["ep"], default=None)
+
+        pos_order = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
+        xi.sort(key=lambda x: pos_order.get(x["pos"], 9))
+
+        output.append("  Starting XI:")
+        for p in xi:
+            tag = ""
+            if captain and p["id"] == captain["id"]:
+                tag = " (C)"
+            elif vice_captain and p["id"] == vice_captain["id"]:
+                tag = " (VC)"
+            output.append(f"   - {p['name']} ({p['pos']}) — {p['ep']:.2f} pts{tag}")
+
+        output.append("  Bench:")
+        bench.sort(key=lambda x: -x["ep"])
+        for i, p in enumerate(bench, 1):
+            output.append(f"   {i}. {p['name']} ({p['pos']}) — {p['ep']:.2f} pts")
+
+        if captain:
+            output.append(f"  Captain: {captain['name']} — {captain['ep']:.2f} pts (doubled = {captain['ep']*2:.2f})")
+        if vice_captain:
+            output.append(f"  Vice-Captain: {vice_captain['name']} — {vice_captain['ep']:.2f} pts")
 
     # --- BANKING ANALYSIS ---
     if banking_analysis and "decision" in banking_analysis:
