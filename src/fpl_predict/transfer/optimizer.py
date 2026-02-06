@@ -806,6 +806,31 @@ def optimize_transfers_two_stage(
     if dead_player_ids:
         log.info(f"Found {len(dead_player_ids)} dead player(s) to prioritize for transfer out")
 
+    # CRITICAL: Check for club limit violations (max 3 per team)
+    # This takes priority over everything else - must be fixed first
+    club_violation_player_ids = set()
+    club_violation_info = {}  # {team_id: count} for teams over limit
+    team_player_counts = {}
+    team_players = {}
+    for p in current_players:
+        team_player_counts[p.team] = team_player_counts.get(p.team, 0) + 1
+        if p.team not in team_players:
+            team_players[p.team] = []
+        team_players[p.team].append(p)
+
+    for team_id, count in team_player_counts.items():
+        if count > MAX_PER_CLUB:
+            club_violation_info[team_id] = count
+            # Find players from this team and mark them for potential transfer out
+            team_name = team_players[team_id][0].name.split()[0] if team_players[team_id] else f"Team {team_id}"
+            log.warning(f"🚨 CLUB LIMIT VIOLATION: {count} players from team {team_id} (max {MAX_PER_CLUB})")
+            for p in team_players[team_id]:
+                club_violation_player_ids.add(p.id)
+                log.info(f"  Must consider transferring out: {p.name} (ID={p.id})")
+
+    if club_violation_player_ids:
+        log.warning(f"Found {len(club_violation_player_ids)} player(s) from clubs over limit - MUST transfer one out")
+
     # Calculate current budget (selling prices + bank)
     import json
     import os
@@ -861,13 +886,21 @@ def optimize_transfers_two_stage(
                 # Calculate EP gain (simple heuristic for initial filtering)
                 ep_gain = p_in.eph - p_out.eph
 
-                # CRITICAL: Add large bonus for removing dead players
-                # Dead players (EP=0) provide no value, so removing them is high priority
+                # CRITICAL: Add HUGE bonus for fixing club limit violations
+                # This is a rule violation that MUST be fixed - highest priority
+                fixes_club_violation = p_out.id in club_violation_player_ids
+                if fixes_club_violation:
+                    # Check that this transfer actually fixes the violation
+                    # (i.e., the incoming player is not from the same over-limit club)
+                    if p_in.team != p_out.team:
+                        club_violation_bonus = 100.0  # Highest priority
+                        ep_gain += club_violation_bonus
+                        log.info(f"🚨 Club violation fix: {p_out.name} -> {p_in.name}, base gain={ep_gain - club_violation_bonus:.2f}, with bonus={ep_gain:.2f}")
+
+                # Add large bonus for removing dead players (lower priority than club violations)
                 is_removing_dead = p_out.id in dead_player_ids
-                if is_removing_dead:
-                    # Add bonus equal to a full season of expected points from the replacement
-                    # This ensures dead player removal is always prioritized
-                    dead_player_bonus = 50.0  # Large bonus to prioritize dead player removal
+                if is_removing_dead and not fixes_club_violation:
+                    dead_player_bonus = 50.0
                     ep_gain += dead_player_bonus
                     log.info(f"Dead player transfer: {p_out.name} -> {p_in.name}, base gain={ep_gain - dead_player_bonus:.2f}, with bonus={ep_gain:.2f}")
 
@@ -875,7 +908,8 @@ def optimize_transfers_two_stage(
                     'transfers': [(p_out, p_in)],
                     'ep_gain': ep_gain,
                     'budget_saved': selling_price - p_in.cost,
-                    'removes_dead': is_removing_dead
+                    'removes_dead': is_removing_dead,
+                    'fixes_club_violation': fixes_club_violation
                 })
         
         # Sort by EP gain and take top candidates
@@ -931,9 +965,14 @@ def optimize_transfers_two_stage(
 
                 ep_gain = p_in.eph - p_out.eph
 
-                # Add bonus for removing dead players
+                # CRITICAL: Add HUGE bonus for fixing club limit violations
+                fixes_club_violation = p_out.id in club_violation_player_ids
+                if fixes_club_violation and p_in.team != p_out.team:
+                    ep_gain += 100.0  # Highest priority
+
+                # Add bonus for removing dead players (lower priority than club violations)
                 is_removing_dead = p_out.id in dead_player_ids
-                if is_removing_dead:
+                if is_removing_dead and not fixes_club_violation:
                     ep_gain += 50.0  # Large bonus to prioritize dead player removal
 
                 budget_diff = selling_price - p_in.cost
@@ -942,7 +981,8 @@ def optimize_transfers_two_stage(
                     'in': p_in,
                     'ep_gain': ep_gain,
                     'budget_diff': budget_diff,
-                    'removes_dead': is_removing_dead
+                    'removes_dead': is_removing_dead,
+                    'fixes_club_violation': fixes_club_violation
                 })
         
         # Sort single transfers by EP gain
@@ -1266,7 +1306,13 @@ def optimize_transfers_two_stage(
             'bench': bench,
             'captain': captain,
             'formation': formation,
-            'objective_improvement': best_objective - baseline_objective
+            'objective_improvement': best_objective - baseline_objective,
+            # Metadata for verbose reporting
+            'dead_players': [{'id': p.id, 'name': p.name, 'pos': p.pos} for p in current_players if p.id in dead_player_ids],
+            'club_violation_info': club_violation_info,  # {team_id: count} for teams over limit
+            'removes_dead': best_option.get('removes_dead', False),
+            'fixes_club_violation': best_option.get('fixes_club_violation', False),
+            'num_transfers': len(best_option['transfers']),
         }
     else:
         log.info("No beneficial transfer found")
@@ -1482,7 +1528,14 @@ def optimize_with_lp(
                     "expected_points_total": expected_points,  # Add this for compatibility
                     "optimization_score": result['objective_improvement'],
                     "solver": "Two-Stage Transfer Optimization",
-                    "human_readable": "\n".join(output)
+                    "human_readable": "\n".join(output),
+                    # Metadata for verbose reporting
+                    "dead_players": result.get('dead_players', []),
+                    "club_violation_info": result.get('club_violation_info', {}),
+                    "removes_dead": result.get('removes_dead', False),
+                    "fixes_club_violation": result.get('fixes_club_violation', False),
+                    "num_transfers": result.get('num_transfers', 0),
+                    "horizon": horizon,
                 }
             elif result is not None:
                 # result is False/empty - no beneficial transfer found
@@ -2368,11 +2421,33 @@ def optimize_transfers(
         if vice_captain:
             output.append(f"Vice-Captain: {vice_captain['name']} - {vice_captain['ep']:.2f} pts")
 
+        # Compute dead players and club violations for metadata
+        dead_players_meta = []
+        for p in players:
+            if p["ep"] == 0 or p["xmins"] == 0:
+                dead_players_meta.append({"id": p["id"], "name": p["name"], "pos": p["position"]})
+
+        club_violation_meta = {}
+        team_counts_meta = {}
+        for p in players:
+            tid = p["team"]
+            team_counts_meta[tid] = team_counts_meta.get(tid, 0) + 1
+        teams_map_meta = {t["id"]: t["name"] for t in js.get("teams", [])}
+        for tid, cnt in team_counts_meta.items():
+            if cnt > MAX_PER_CLUB:
+                club_violation_meta[tid] = cnt
+
         return {
             "squad": players,
             "expected_points_gw1": total_ep,
             "total_cost": sum(p["cost"] for p in players),
-            "human_readable": "\n".join(output)
+            "human_readable": "\n".join(output),
+            # Metadata for verbose reporting
+            "dead_players": dead_players_meta,
+            "club_violation_info": club_violation_meta,
+            "removes_dead": False,
+            "fixes_club_violation": False,
+            "horizon": horizon,
         }
     
     # Use LP optimizer if requested and available
