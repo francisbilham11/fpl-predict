@@ -92,6 +92,9 @@ class FPL2025ChipStrategy:
         self.config = config or ChipStrategy2025Config()
         self.h1_deadline = 19
         self.h2_start = 20
+        self._detected_dgws: List[int] = []
+        self._detected_bgws: List[int] = []
+        self._outstanding_fixtures: Dict[str, int] = {}
         
     def plan_chips(
         self,
@@ -292,72 +295,210 @@ class FPL2025ChipStrategy:
         player_data: pd.DataFrame
     ) -> Dict[str, ChipRecommendation]:
         """
-        Plan second half chips (available from GW20)
-        
-        Strategy for H2:
-        - Save for DGWs (typically GW34-37)
-        - FH for BGWs (typically GW33)
-        - Higher thresholds due to DGW potential
+        Plan second half chips using scenario-based sequencing.
+
+        Picks chips in priority order, tracking occupied GWs to prevent
+        conflicts and ensure logical sequences (e.g. FH on BGW then WC
+        the week after to rebuild).
+
+        Scenarios:
+        A: BGWs + DGWs → FH(BGW) → WC(BGW+1) → TC(best DGW) → BB(different DGW)
+        B: BGWs only   → FH(BGW) → WC(BGW+1) → TC(HOLD) → BB(HOLD)
+        C: DGWs only   → WC(before DGWs) → TC(best DGW) → BB(different DGW) → FH(HOLD)
+        D: Neither      → All HOLD
         """
-        
-        recs = {}
-        
         # Predict DGWs and BGWs
         dgws, bgws = self._predict_dgw_bgw()
-        
-        # 1. H2 Triple Captain - Target best DGW
-        if dgws:
-            best_dgw = self._find_best_captain_dgw(dgws, owned_ids, player_data)
-            if best_dgw:
-                recs['H2_TC'] = ChipRecommendation(
-                    chip_type=ChipType.H2_TRIPLE_CAPTAIN,
-                    gameweek=best_dgw['gw'],
-                    expected_value=best_dgw['ep'] * 3,
-                    confidence=0.9,
-                    urgency=0.1 if current_gw < 30 else 0.5,
-                    reasons=[
-                        f"Double gameweek for {best_dgw['player']}",
-                        f"Expected {best_dgw['ep']:.1f} points (captained)",
-                        "Premium DGW opportunity"
-                    ],
-                    player_targets=[best_dgw['player']]
-                )
-        
-        # 2. H2 Bench Boost - Target DGW with full squad playing twice
-        if dgws:
-            best_bb_dgw = self._find_best_bench_boost_dgw(dgws, owned_ids, player_data)
-            if best_bb_dgw:
-                recs['H2_BB'] = ChipRecommendation(
-                    chip_type=ChipType.H2_BENCH_BOOST,
-                    gameweek=best_bb_dgw['gw'],
-                    expected_value=best_bb_dgw['bench_ep'],
-                    confidence=0.85,
-                    urgency=0.1 if current_gw < 30 else 0.5,
-                    reasons=[
-                        f"Double gameweek for {best_bb_dgw['dgw_players']} bench players",
-                        f"Bench expected {best_bb_dgw['bench_ep']:.1f} points",
-                        "Optimal BB opportunity"
-                    ]
-                )
-        
-        # 3. H2 Free Hit - Target biggest BGW
-        if bgws:
-            best_bgw = max(bgws, key=lambda gw: 38 - gw)  # Prefer later BGWs
-            recs['H2_FH'] = ChipRecommendation(
-                chip_type=ChipType.H2_FREE_HIT,
-                gameweek=best_bgw,
-                expected_value=40,  # Estimated
+        # Store for use in strategy tips
+        self._detected_dgws = dgws
+        self._detected_bgws = bgws
+
+        has_bgws = len(bgws) > 0
+        has_dgws = len(dgws) > 0
+
+        if has_bgws and has_dgws:
+            return self._sequence_scenario_a(current_gw, owned_ids, player_data, dgws, bgws)
+        elif has_bgws:
+            return self._sequence_scenario_b(current_gw, owned_ids, player_data, bgws)
+        elif has_dgws:
+            return self._sequence_scenario_c(current_gw, owned_ids, player_data, dgws)
+        else:
+            return self._sequence_scenario_d()
+
+    # ---------- Scenario sequencing methods ----------
+
+    def _score_bgw_for_fh(self, bgws: List[int], owned_ids: Set[int]) -> int:
+        """Pick the BGW where the user's squad has the fewest playing players.
+
+        Worst coverage = best Free Hit target.
+        """
+        if not bgws:
+            return bgws[0] if bgws else 33
+
+        try:
+            fixtures = get_fixtures()
+            boot = get_bootstrap()
+
+            # Map player_id → team_id
+            pid_to_team = {p['id']: p['team'] for p in boot.get('elements', [])}
+            owned_teams = {pid_to_team[pid] for pid in owned_ids if pid in pid_to_team}
+
+            best_bgw = bgws[0]
+            fewest_playing = 999
+
+            for gw in bgws:
+                # Teams with a fixture in this GW
+                teams_playing = set()
+                for f in fixtures:
+                    if f.get('event') == gw:
+                        teams_playing.add(f['team_h'])
+                        teams_playing.add(f['team_a'])
+
+                # How many of our players' teams are playing?
+                coverage = len(owned_teams & teams_playing)
+                if coverage < fewest_playing:
+                    fewest_playing = coverage
+                    best_bgw = gw
+
+            return best_bgw
+        except Exception:
+            # Fallback: pick the first BGW
+            return bgws[0]
+
+    def _make_hold(self, chip_type: ChipType, reason: str) -> ChipRecommendation:
+        """Create a HOLD recommendation (gameweek=0 sentinel)."""
+        return ChipRecommendation(
+            chip_type=chip_type,
+            gameweek=0,
+            expected_value=0,
+            confidence=0.0,
+            urgency=0.0,
+            reasons=[reason]
+        )
+
+    def _sequence_scenario_a(
+        self,
+        current_gw: int,
+        owned_ids: Set[int],
+        player_data: pd.DataFrame,
+        dgws: List[int],
+        bgws: List[int]
+    ) -> Dict[str, ChipRecommendation]:
+        """Scenario A: BGWs + DGWs confirmed.
+
+        Order: FH(BGW) → WC(BGW+1) → TC(best DGW) → BB(different DGW)
+        """
+        recs = {}
+        occupied_gws: Set[int] = set()
+
+        # 1. FH on worst-coverage BGW
+        fh_gw = self._score_bgw_for_fh(bgws, owned_ids)
+        recs['H2_FH'] = ChipRecommendation(
+            chip_type=ChipType.H2_FREE_HIT,
+            gameweek=fh_gw,
+            expected_value=40,
+            confidence=0.85,
+            urgency=0.1 if current_gw < fh_gw - 2 else 0.6,
+            reasons=[
+                f"Blank GW{fh_gw} — limited fixtures",
+                "Maximise playing XI on a blank gameweek",
+            ]
+        )
+        occupied_gws.add(fh_gw)
+
+        # 2. WC to rebuild after FH
+        wc_gw = self._find_h2_wildcard_gw(dgws, fh_gw=fh_gw, excluded_gws=occupied_gws)
+        if wc_gw:
+            recs['H2_WC'] = ChipRecommendation(
+                chip_type=ChipType.H2_WILDCARD,
+                gameweek=wc_gw,
+                expected_value=0,
                 confidence=0.8,
-                urgency=0.1,
+                urgency=0.2,
                 reasons=[
-                    f"Blank gameweek - limited fixtures",
-                    "Maximize playing XI",
-                    "Avoid mass benchings"
+                    f"Rebuild squad after Free Hit on GW{fh_gw}",
+                    "Position for upcoming DGWs",
                 ]
             )
-        
-        # 4. H2 Wildcard - Before DGW run
-        wc_gw = self._find_h2_wildcard_gw(dgws)
+            occupied_gws.add(wc_gw)
+
+        # 3. TC on best DGW
+        best_dgw = self._find_best_captain_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        if best_dgw:
+            recs['H2_TC'] = ChipRecommendation(
+                chip_type=ChipType.H2_TRIPLE_CAPTAIN,
+                gameweek=best_dgw['gw'],
+                expected_value=best_dgw['ep'] * 3,
+                confidence=0.9,
+                urgency=0.1 if current_gw < 30 else 0.5,
+                reasons=[
+                    f"Double gameweek for {best_dgw['player']}",
+                    f"Expected {best_dgw['ep']:.1f} points (captained)",
+                    "Premium DGW opportunity",
+                ],
+                player_targets=[best_dgw['player']]
+            )
+            occupied_gws.add(best_dgw['gw'])
+        else:
+            recs['H2_TC'] = self._make_hold(
+                ChipType.H2_TRIPLE_CAPTAIN,
+                "No available DGW for TC — HOLD pending fixture announcements"
+            )
+
+        # 4. BB on a different DGW
+        best_bb = self._find_best_bench_boost_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        if best_bb:
+            label = "Double gameweek" if best_bb['dgw_players'] > 0 else "Best remaining gameweek"
+            recs['H2_BB'] = ChipRecommendation(
+                chip_type=ChipType.H2_BENCH_BOOST,
+                gameweek=best_bb['gw'],
+                expected_value=best_bb['bench_ep'],
+                confidence=0.85 if best_bb['dgw_players'] > 0 else 0.6,
+                urgency=0.1 if current_gw < 30 else 0.5,
+                reasons=[
+                    f"{label} for bench players",
+                    f"Bench expected {best_bb['bench_ep']:.1f} points",
+                ]
+            )
+        else:
+            recs['H2_BB'] = self._make_hold(
+                ChipType.H2_BENCH_BOOST,
+                "No suitable GW for BB — HOLD pending fixture announcements"
+            )
+
+        return recs
+
+    def _sequence_scenario_b(
+        self,
+        current_gw: int,
+        owned_ids: Set[int],
+        player_data: pd.DataFrame,
+        bgws: List[int]
+    ) -> Dict[str, ChipRecommendation]:
+        """Scenario B: BGWs only, no DGWs confirmed.
+
+        Order: FH(BGW) → WC(BGW+1) → TC(HOLD) → BB(HOLD)
+        """
+        recs = {}
+        occupied_gws: Set[int] = set()
+
+        # 1. FH on worst-coverage BGW
+        fh_gw = self._score_bgw_for_fh(bgws, owned_ids)
+        recs['H2_FH'] = ChipRecommendation(
+            chip_type=ChipType.H2_FREE_HIT,
+            gameweek=fh_gw,
+            expected_value=40,
+            confidence=0.85,
+            urgency=0.1 if current_gw < fh_gw - 2 else 0.6,
+            reasons=[
+                f"Blank GW{fh_gw} — limited fixtures",
+                "Maximise playing XI on a blank gameweek",
+            ]
+        )
+        occupied_gws.add(fh_gw)
+
+        # 2. WC to rebuild after FH
+        wc_gw = self._find_h2_wildcard_gw([], fh_gw=fh_gw, excluded_gws=occupied_gws)
         if wc_gw:
             recs['H2_WC'] = ChipRecommendation(
                 chip_type=ChipType.H2_WILDCARD,
@@ -366,13 +507,118 @@ class FPL2025ChipStrategy:
                 confidence=0.75,
                 urgency=0.2,
                 reasons=[
-                    "Position before DGW run",
-                    "Build squad for BB potential",
-                    "Navigate fixture congestion"
+                    f"Rebuild squad after Free Hit on GW{fh_gw}",
+                    "No DGWs confirmed yet — rebuild for run-in",
                 ]
             )
-        
+            occupied_gws.add(wc_gw)
+
+        # 3. TC — HOLD (no DGWs)
+        recs['H2_TC'] = self._make_hold(
+            ChipType.H2_TRIPLE_CAPTAIN,
+            "No DGWs confirmed — HOLD for future DGW announcement"
+        )
+
+        # 4. BB — HOLD (no DGWs)
+        recs['H2_BB'] = self._make_hold(
+            ChipType.H2_BENCH_BOOST,
+            "No DGWs confirmed — HOLD for future DGW announcement"
+        )
+
         return recs
+
+    def _sequence_scenario_c(
+        self,
+        current_gw: int,
+        owned_ids: Set[int],
+        player_data: pd.DataFrame,
+        dgws: List[int]
+    ) -> Dict[str, ChipRecommendation]:
+        """Scenario C: DGWs only, no BGWs.
+
+        Order: WC(before DGWs) → TC(best DGW) → BB(different DGW) → FH(HOLD)
+        """
+        recs = {}
+        occupied_gws: Set[int] = set()
+
+        # 1. WC to prepare for DGWs
+        wc_gw = self._find_h2_wildcard_gw(dgws, excluded_gws=occupied_gws)
+        if wc_gw:
+            recs['H2_WC'] = ChipRecommendation(
+                chip_type=ChipType.H2_WILDCARD,
+                gameweek=wc_gw,
+                expected_value=0,
+                confidence=0.75,
+                urgency=0.2,
+                reasons=[
+                    "Position squad before DGW run",
+                    "Build squad for TC/BB potential",
+                ]
+            )
+            occupied_gws.add(wc_gw)
+
+        # 2. TC on best DGW
+        best_dgw = self._find_best_captain_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        if best_dgw:
+            recs['H2_TC'] = ChipRecommendation(
+                chip_type=ChipType.H2_TRIPLE_CAPTAIN,
+                gameweek=best_dgw['gw'],
+                expected_value=best_dgw['ep'] * 3,
+                confidence=0.9,
+                urgency=0.1 if current_gw < 30 else 0.5,
+                reasons=[
+                    f"Double gameweek for {best_dgw['player']}",
+                    f"Expected {best_dgw['ep']:.1f} points (captained)",
+                    "Premium DGW opportunity",
+                ],
+                player_targets=[best_dgw['player']]
+            )
+            occupied_gws.add(best_dgw['gw'])
+
+        # 3. BB on different DGW (or SGW fallback)
+        best_bb = self._find_best_bench_boost_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        if best_bb:
+            label = "Double gameweek" if best_bb['dgw_players'] > 0 else "Best remaining gameweek"
+            recs['H2_BB'] = ChipRecommendation(
+                chip_type=ChipType.H2_BENCH_BOOST,
+                gameweek=best_bb['gw'],
+                expected_value=best_bb['bench_ep'],
+                confidence=0.85 if best_bb['dgw_players'] > 0 else 0.6,
+                urgency=0.1 if current_gw < 30 else 0.5,
+                reasons=[
+                    f"{label} for bench players",
+                    f"Bench expected {best_bb['bench_ep']:.1f} points",
+                ]
+            )
+
+        # 4. FH — HOLD (no BGWs)
+        recs['H2_FH'] = self._make_hold(
+            ChipType.H2_FREE_HIT,
+            "No BGWs confirmed — HOLD for future BGW announcement"
+        )
+
+        return recs
+
+    def _sequence_scenario_d(self) -> Dict[str, ChipRecommendation]:
+        """Scenario D: No BGWs or DGWs confirmed. All HOLD."""
+        return {
+            'H2_FH': self._make_hold(
+                ChipType.H2_FREE_HIT,
+                "No BGWs confirmed — HOLD pending fixture announcements"
+            ),
+            'H2_WC': self._make_hold(
+                ChipType.H2_WILDCARD,
+                "No BGWs/DGWs confirmed — HOLD pending fixture announcements"
+            ),
+            'H2_TC': self._make_hold(
+                ChipType.H2_TRIPLE_CAPTAIN,
+                "No DGWs confirmed — HOLD pending fixture announcements"
+            ),
+            'H2_BB': self._make_hold(
+                ChipType.H2_BENCH_BOOST,
+                "No DGWs confirmed — HOLD pending fixture announcements"
+            ),
+        }
     
     def _calculate_h1_urgency(self, current_gw: int) -> float:
         """Calculate urgency factor for H1 chips"""
@@ -386,17 +632,80 @@ class FPL2025ChipStrategy:
     
     def _predict_dgw_bgw(self) -> Tuple[List[int], List[int]]:
         """
-        Predict likely DGWs and BGWs in H2
-        
-        Based on historical patterns:
-        - BGWs: GW29, GW33 (FA Cup)
-        - DGWs: GW34, GW37 (catch-up fixtures)
+        Detect DGWs and BGWs from actual FPL fixture data.
+
+        A normal gameweek has 10 fixtures (20 teams / 2 per fixture).
+        - BGW: fewer than 10 fixtures scheduled
+        - DGW: more than 10 fixtures scheduled (some teams play twice)
+
+        Also detects teams with fewer scheduled fixtures than expected,
+        which predicts future DGWs when those games are rescheduled.
         """
-        # These are typical patterns - would need fixture analysis for accuracy
-        likely_dgws = [34, 37]
-        likely_bgws = [29, 33]
-        
-        return likely_dgws, likely_bgws
+        try:
+            fixtures = get_fixtures()
+            boot = get_bootstrap()
+            current_gw = self._get_current_gw()
+            teams_map = {t["id"]: t["short_name"] for t in boot.get("teams", [])}
+            total_gws = len(boot.get("events", []))
+
+            # Count fixtures per gameweek
+            fixtures_per_gw: Dict[int, int] = defaultdict(int)
+            for f in fixtures:
+                gw = f.get("event")
+                if gw is not None:
+                    fixtures_per_gw[int(gw)] += 1
+
+            likely_dgws = []
+            likely_bgws = []
+
+            for gw in sorted(fixtures_per_gw.keys()):
+                if gw < current_gw:
+                    continue
+                count = fixtures_per_gw[gw]
+                if count > 10:
+                    likely_dgws.append(gw)
+                    log.info(f"DGW detected: GW{gw} ({count} fixtures)")
+                elif count < 10:
+                    likely_bgws.append(gw)
+                    log.info(f"BGW detected: GW{gw} ({count} fixtures)")
+
+            # Detect teams with outstanding fixtures (fewer than expected)
+            # Each team should play `total_gws` games (38 in a standard season)
+            team_scheduled = defaultdict(int)
+            unscheduled_fixtures = []
+            for f in fixtures:
+                if f.get("event") is not None:
+                    team_scheduled[f["team_h"]] += 1
+                    team_scheduled[f["team_a"]] += 1
+                elif not f.get("finished"):
+                    unscheduled_fixtures.append(f)
+
+            # Teams with fewer games than expected will get DGWs
+            self._outstanding_fixtures = {}
+            for tid, count in team_scheduled.items():
+                remaining_expected = total_gws
+                if count < remaining_expected:
+                    outstanding = remaining_expected - count
+                    team_name = teams_map.get(tid, f"Team {tid}")
+                    self._outstanding_fixtures[team_name] = outstanding
+                    log.info(f"{team_name}: {count}/{remaining_expected} fixtures scheduled ({outstanding} outstanding)")
+
+            if unscheduled_fixtures:
+                log.info(f"{len(unscheduled_fixtures)} unscheduled fixture(s) — will produce future DGWs")
+                for f in unscheduled_fixtures:
+                    home = teams_map.get(f.get("team_h"), "?")
+                    away = teams_map.get(f.get("team_a"), "?")
+                    log.info(f"  Unscheduled: {home} vs {away}")
+
+            if not likely_dgws and not likely_bgws:
+                log.info("No DGWs or BGWs detected in remaining fixtures")
+
+            return likely_dgws, likely_bgws
+
+        except Exception as e:
+            log.warning(f"Could not fetch fixtures for DGW/BGW detection: {e}")
+            self._outstanding_fixtures = {}
+            return [], []
     
     def _get_current_gw(self) -> int:
         """Get current gameweek from API"""
@@ -1208,10 +1517,15 @@ class FPL2025ChipStrategy:
         self,
         dgws: List[int],
         owned_ids: Set[int],
-        player_data: pd.DataFrame
+        player_data: pd.DataFrame,
+        excluded_gws: Optional[Set[int]] = None
     ) -> Optional[Dict]:
         """Find best captain for DGWs from owned players"""
         if not owned_ids or player_data.empty or not dgws:
+            return None
+
+        available_dgws = [gw for gw in dgws if gw not in (excluded_gws or set())]
+        if not available_dgws:
             return None
 
         owned = player_data[player_data['player_id'].isin(owned_ids)]
@@ -1232,7 +1546,7 @@ class FPL2025ChipStrategy:
         dgw_ep = best.get('ep_blend', 0) * 2.0
 
         return {
-            'gw': dgws[0] if dgws else 34,
+            'gw': available_dgws[0],
             'player': best.get('name', 'Unknown'),
             'ep': dgw_ep
         }
@@ -1241,10 +1555,11 @@ class FPL2025ChipStrategy:
         self,
         dgws: List[int],
         owned_ids: Set[int],
-        player_data: pd.DataFrame
+        player_data: pd.DataFrame,
+        excluded_gws: Optional[Set[int]] = None
     ) -> Optional[Dict]:
-        """Find best BB opportunity in DGWs from owned players"""
-        if not owned_ids or player_data.empty or not dgws:
+        """Find best BB opportunity in DGWs (or best SGW as fallback) from owned players"""
+        if not owned_ids or player_data.empty:
             return None
 
         owned = player_data[player_data['player_id'].isin(owned_ids)]
@@ -1255,21 +1570,60 @@ class FPL2025ChipStrategy:
 
         bench = owned.nsmallest(4, 'ep_blend')
 
-        # Estimate DGW bench points as 2x single gameweek
-        bench_ep = bench['ep_blend'].sum() * 2.0
+        available_dgws = [gw for gw in dgws if gw not in (excluded_gws or set())]
 
-        return {
-            'gw': dgws[-1] if dgws else 37,
-            'bench_ep': bench_ep,
-            'dgw_players': 4  # Assume all 4 bench players have DGW
-        }
+        if available_dgws:
+            # Estimate DGW bench points as 2x single gameweek
+            bench_ep = bench['ep_blend'].sum() * 2.0
+            return {
+                'gw': available_dgws[-1],
+                'bench_ep': bench_ep,
+                'dgw_players': 4
+            }
+
+        # SGW fallback: pick best remaining SGW (GW34-37 range)
+        bench_ep = bench['ep_blend'].sum()
+        excluded = excluded_gws or set()
+        for gw in range(37, 27, -1):
+            if gw not in excluded:
+                return {
+                    'gw': gw,
+                    'bench_ep': bench_ep,
+                    'dgw_players': 0
+                }
+
+        return None
     
-    def _find_h2_wildcard_gw(self, dgws: List[int]) -> Optional[int]:
-        """Find optimal H2 wildcard timing"""
+    def _find_h2_wildcard_gw(
+        self,
+        dgws: List[int],
+        fh_gw: Optional[int] = None,
+        excluded_gws: Optional[Set[int]] = None
+    ) -> Optional[int]:
+        """Find optimal H2 wildcard timing.
+
+        If a Free Hit GW is provided, place WC the week after (rebuild squad).
+        Edge case: if FH is on GW38, place WC the week before instead.
+        Otherwise fall back to 2 weeks before first DGW, or GW30 default.
+        """
+        excluded = excluded_gws or set()
+
+        if fh_gw:
+            # Rebuild after Free Hit
+            wc_gw = fh_gw + 1 if fh_gw < 38 else fh_gw - 1
+            if wc_gw not in excluded:
+                return wc_gw
+
         if dgws:
-            # Use WC 1-2 weeks before first major DGW
-            return max(28, dgws[0] - 2)
-        return 30
+            # Prepare before DGW run
+            candidate = max(28, dgws[0] - 2)
+            if candidate not in excluded:
+                return candidate
+
+        # Default: GW30
+        if 30 not in excluded:
+            return 30
+        return None
     
     def _explain_strategy(self, recommendations: Dict, current_gw: int, show_teams: bool = False, used_chips: Set[str] = None):
         """Explain the strategy to user"""
@@ -1324,10 +1678,10 @@ class FPL2025ChipStrategy:
                 print("⚠️ No specific recommendations yet - monitor your team performance")
                 print("💡 Consider using chips around GW15-18 to avoid losing them")
 
-        # Show H1 Free Hit team if requested
+        # Show H1 Free Hit team if requested (skip HOLD chips)
         if show_teams:
             h1_fh = h1_chips.get('H1_FH')
-            if h1_fh:
+            if h1_fh and h1_fh.gameweek > 0:
                 print("\n" + "-" * 60)
                 print("📋 H1 FREE HIT TEAM PREVIEW")
                 print("-" * 60 + "\n")
@@ -1340,50 +1694,90 @@ class FPL2025ChipStrategy:
         for chip_key, rec in h2_chips.items():
             self._print_chip_recommendation(rec)
 
-        # Show H2 Free Hit team if requested
+        # Show H2 Free Hit team if requested (skip HOLD chips)
         if show_teams:
             h2_fh = h2_chips.get('H2_FH')
-            if h2_fh:
+            if h2_fh and h2_fh.gameweek > 0:
                 print("\n" + "-" * 60)
                 print("📋 H2 FREE HIT TEAM PREVIEW")
                 print("-" * 60 + "\n")
                 fh_team = generate_free_hit_team(h2_fh.gameweek)
                 print(fh_team)
 
+        # Summary of held chips
+        held_chips = [
+            rec for rec in recommendations.values()
+            if rec.gameweek == 0
+        ]
+        if held_chips:
+            held_names = [rec.chip_type.value.replace('H1_', '').replace('H2_', '') for rec in held_chips]
+            print(f"\n⏳ Chips on HOLD ({len(held_chips)}): {', '.join(held_names)}")
+            print("   These will be assigned once fixtures are confirmed.")
+
         print("\n" + "=" * 70)
 
         # Strategic notes
         print("\n💡 KEY STRATEGY POINTS:")
-        print("• H1: Lower thresholds - don't be too greedy waiting for perfect spots")
-        print("• H1: GW17-19 urgency - better to use than lose")
-        print("• H2: Save TC/BB for DGWs (likely GW34, 37)")
-        print("• H2: Save FH for BGWs (likely GW29, 33)")
+        if current_gw <= self.h1_deadline:
+            print("• H1: Lower thresholds - don't be too greedy waiting for perfect spots")
+            print("• H1: GW17-19 urgency - better to use than lose")
+
+        if self._detected_dgws:
+            dgw_str = ", ".join(f"GW{gw}" for gw in self._detected_dgws)
+            print(f"• H2: Save TC/BB for DGWs ({dgw_str})")
+        else:
+            print("• H2: Save TC/BB for DGWs (none confirmed yet — monitor fixture announcements)")
+
+        if self._detected_bgws:
+            bgw_str = ", ".join(f"GW{gw}" for gw in self._detected_bgws)
+            print(f"• H2: Save FH for BGWs ({bgw_str})")
+        else:
+            print("• H2: Save FH for BGWs (none confirmed yet — monitor fixture announcements)")
+
+        if self._outstanding_fixtures:
+            teams_str = ", ".join(
+                f"{team} ({n} game{'s' if n > 1 else ''})"
+                for team, n in sorted(self._outstanding_fixtures.items(), key=lambda x: -x[1])
+            )
+            print(f"• ⚠️  Teams with outstanding fixtures (expect future DGWs): {teams_str}")
+
         print("• WC: Time around international breaks or fixture swings")
 
-        # Add hint about show-teams if not used
+        # Add hint about show-teams if not used (only for non-HOLD FH chips)
         if not show_teams:
-            fh_recommendations = [rec for key, rec in recommendations.items() if 'FH' in key]
+            fh_recommendations = [
+                rec for key, rec in recommendations.items()
+                if 'FH' in key and rec.gameweek > 0
+            ]
             if fh_recommendations:
                 print("\n💡 TIP: Use --show-teams to see the full Free Hit XI for recommended gameweeks")
                 print("   Or run: fpl chips free-hit --gw X")
         
     def _print_chip_recommendation(self, rec: ChipRecommendation):
         """Print a single chip recommendation"""
-        
+
         chip_name = rec.chip_type.value.replace('H1_', '').replace('H2_', '')
         emoji = {'TC': '👑', 'BB': '💪', 'FH': '🎯', 'WC': '🔄'}.get(chip_name, '📌')
-        
+
+        if rec.gameweek == 0:
+            # HOLD chip — no gameweek assigned yet
+            print(f"{emoji} {chip_name}: HOLD (monitoring)")
+            for reason in rec.reasons:
+                print(f"   • {reason}")
+            print()
+            return
+
         print(f"{emoji} {chip_name}: GW{rec.gameweek}")
-        
+
         if rec.urgency > 0.3:
             print(f"   ⚠️ Urgency: {'HIGH' if rec.urgency > 0.7 else 'MEDIUM'}")
-        
+
         print(f"   Expected: {rec.expected_value:.1f} pts")
         print(f"   Confidence: {rec.confidence:.0%}")
-        
+
         for reason in rec.reasons:
             print(f"   • {reason}")
-        
+
         if rec.player_targets:
             print(f"   Target: {', '.join(rec.player_targets)}")
         print()
