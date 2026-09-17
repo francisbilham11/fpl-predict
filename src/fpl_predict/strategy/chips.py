@@ -375,8 +375,8 @@ class ChipStrategy:
                     confidence=0.8,
                     urgency=0.3 if current_gw < 15 else 0.7,
                     reasons=[
-                        f"International break in GW{wc_gw}"
-                        if wc_gw in {4, 8, 12}
+                        f"International break before GW{wc_gw}"
+                        if wc_gw in self._detect_international_break_gws()
                         else "Fixture swing opportunity",
                         "Time to restructure team mid-H1",
                     ],
@@ -947,9 +947,39 @@ class ChipStrategy:
         except:
             return pd.DataFrame()
 
+    def _detect_international_break_gws(self) -> Set[int]:
+        """Gameweeks whose deadline follows an international break.
+
+        FPL doesn't mark breaks explicitly, but a gap between one gameweek's deadline and the
+        next of roughly 12+ days (a normal gap is 6-8) is one: the fixture list clears for
+        internationals, then resumes the following weekend. Detected from live deadline_time
+        data rather than hardcoded gameweek numbers, which drift every season as the calendar
+        (and any mid-season tournament, e.g. a winter World Cup) shifts.
+        """
+        import datetime as _dt
+
+        events = sorted(get_bootstrap().get("events", []), key=lambda e: e["id"])
+        breaks = set()
+        for prev, cur in zip(events, events[1:]):
+            try:
+                d_prev = _dt.datetime.fromisoformat(prev["deadline_time"].replace("Z", "+00:00"))
+                d_cur = _dt.datetime.fromisoformat(cur["deadline_time"].replace("Z", "+00:00"))
+            except (KeyError, ValueError, TypeError):
+                continue
+            if (d_cur - d_prev).days >= 12:
+                breaks.add(cur["id"])
+        return breaks
+
     def _find_h1_wildcard_gw(self, current_gw: int) -> Optional[int]:
         """Find optimal H1 wildcard GW"""
-        # Prefer international breaks or mid-H1
+        # Prefer a gameweek right after an international break: squads are freshest to assess
+        # (injuries/rotation/form clarify) right when everyone's back from duty.
+        breaks = self._detect_international_break_gws()
+        preferred = sorted(gw for gw in breaks if current_gw <= gw <= self.h1_deadline)
+        if preferred:
+            return preferred[0]
+
+        # No break left in the window — fall back to the configured preference, then mid-H1.
         preferred = [gw for gw in self.config.h1_wc_preferred_gws if gw >= current_gw]
         if preferred:
             return min(preferred)
