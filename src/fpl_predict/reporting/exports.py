@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pathlib
 from typing import List, Dict, Optional
-import requests
 import pandas as pd
 
+from ..data.fpl_api import get_bootstrap, get_fixtures
 from ..utils.cache import PROC
 from ..utils.io import read_parquet
 from ..utils.logging import get_logger
@@ -25,7 +25,7 @@ def _pergw_factors_from_fpl(team_id: int, H: int) -> list[float]:
     We map FPL difficulty 1..5 to a multiplicative factor around 1.0.
     diff=3 -> 1.00, diff=1 -> ~1.16 (easy), diff=5 -> ~0.84 (hard)."""
     try:
-        fx = requests.get("https://fantasy.premierleague.com/api/fixtures/", timeout=30).json()
+        fx = get_fixtures()
     except Exception:
         return [1.0] * H
 
@@ -51,9 +51,7 @@ def _pergw_factors_from_fpl(team_id: int, H: int) -> list[float]:
 
 def _bootstrap_maps() -> tuple[Dict[int, str], Dict[int, str], Dict[int, str]]:
     """Return (player_id->name, player_id->position, team_id->team_name) from FPL bootstrap."""
-    r = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=30)
-    r.raise_for_status()
-    js = r.json()
+    js = get_bootstrap()
     pos_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
     id2name = {int(e["id"]): e["web_name"] for e in js["elements"]}

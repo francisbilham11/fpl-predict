@@ -1,64 +1,162 @@
 """
-FPL 2025/26 Chip Strategy - Updated for Double Chips System (FIXED)
+Chip strategy for the two-set chip system: eight chips, one set per half of the season.
 
-Key Changes:
-- 2 sets of chips (8 total): one for H1 (GW1-19), one for H2 (GW20-38)
-- H1 chips expire at GW19 deadline - use it or lose it!
-- No DGWs/BGWs expected in H1 (not affected by cups)
-- DGWs/BGWs mainly in H2 (GW28-38 typically)
-- ENSURES ONLY ONE CHIP PER GAMEWEEK
+Chip windows come from `bootstrap-static.chips` rather than being hardcoded, because the
+windows move. In 2026/27 the first Wildcard and Free Hit only open at GW2, while Bench Boost
+and Triple Captain are available from GW1, so a plan that assumed "H1 means GW1-19 for
+everything" would recommend a chip in a gameweek it cannot be played.
+
+Only one chip is ever assigned to a given gameweek.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
-from enum import Enum
-import pandas as pd
-import numpy as np
 from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
 
+import pandas as pd
+
+from ..data.fpl_api import get_bootstrap, get_fixtures
 from ..utils.cache import PROC
 from ..utils.io import read_parquet
 from ..utils.logging import get_logger
-from ..data.fpl_api import get_bootstrap, get_fixtures
 
 log = get_logger(__name__)
+
+# Fallbacks for when bootstrap-static.chips cannot be read.
+DEFAULT_H1_DEADLINE = 19
+DEFAULT_H2_START = 20
+FINAL_GW = 38
+
+# bootstrap chip name -> the short code used throughout this module
+CHIP_CODES = {"wildcard": "WC", "freehit": "FH", "bboost": "BB", "3xc": "TC"}
+
+
+@dataclass
+class ChipWindows:
+    """When each chip can actually be played, read from the FPL API.
+
+    `first_available` is keyed on (half, code), e.g. ("H1", "FH") -> 2, and is the earliest
+    gameweek that chip may be used in that half.
+    """
+
+    h1_deadline: int = DEFAULT_H1_DEADLINE
+    h2_start: int = DEFAULT_H2_START
+    first_available: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    last_available: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    source: str = "default"
+
+    def earliest(self, half: str, code: str, fallback: int) -> int:
+        return self.first_available.get((half, code), fallback)
+
+    def latest(self, half: str, code: str, fallback: int) -> int:
+        return self.last_available.get((half, code), fallback)
+
+
+def load_chip_windows(bootstrap: dict | None = None) -> ChipWindows:
+    """Derive chip availability windows from bootstrap-static.
+
+    Each chip name appears once per set. The sets are separated by ordering each name's
+    windows by `start_event` and taking the earliest as the first-half chip, rather than by
+    testing `start_event < 20`: assuming where the halfway point falls is the very thing
+    this function exists to stop doing.
+    """
+    try:
+        bs = get_bootstrap() if bootstrap is None else bootstrap
+        chips = bs.get("chips") or []
+        if not chips:
+            raise ValueError("bootstrap-static has no chips array")
+
+        by_code: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        for chip in chips:
+            code = CHIP_CODES.get(chip.get("name"))
+            if not code:
+                continue
+            start = int(chip.get("start_event") or 1)
+            stop = int(chip.get("stop_event") or FINAL_GW)
+            by_code[code].append((start, stop))
+
+        if not by_code:
+            raise ValueError("no recognised chips in bootstrap-static")
+
+        first: Dict[Tuple[str, str], int] = {}
+        last: Dict[Tuple[str, str], int] = {}
+        h1_stops: List[int] = []
+        h2_starts: List[int] = []
+
+        for code, windows_for_code in by_code.items():
+            for index, (start, stop) in enumerate(sorted(windows_for_code)):
+                half = "H1" if index == 0 else "H2"
+                first[(half, code)] = start
+                last[(half, code)] = stop
+                if half == "H1":
+                    h1_stops.append(stop)
+                else:
+                    h2_starts.append(start)
+
+        result = ChipWindows(
+            h1_deadline=max(h1_stops) if h1_stops else DEFAULT_H1_DEADLINE,
+            h2_start=min(h2_starts) if h2_starts else DEFAULT_H2_START,
+            first_available=first,
+            last_available=last,
+            source="fpl_api",
+        )
+        late = {c: gw for (h, c), gw in sorted(first.items()) if h == "H1" and gw > 1}
+        log.info(
+            "Chip windows from API: H1 ends GW%d, H2 starts GW%d%s",
+            result.h1_deadline,
+            result.h2_start,
+            f", not playable in GW1: {late}" if late else "",
+        )
+        return result
+    except Exception as e:
+        log.warning(
+            "Could not read chip windows from the API (%s); falling back to GW1-%d / GW%d-%d",
+            e,
+            DEFAULT_H1_DEADLINE,
+            DEFAULT_H2_START,
+            FINAL_GW,
+        )
+        return ChipWindows()
 
 
 # ----------------------------- Configuration -----------------------------
 
+
 @dataclass
-class ChipStrategy2025Config:
-    """Configuration for 2025/26 double chips strategy"""
-    
+class ChipStrategyConfig:
+    """Thresholds for the two-set chip system."""
+
     # First Half (GW1-19) - No DGWs expected, lower thresholds
-    h1_tc_min_ep: float = 7.5      # Lower threshold since no DGWs
-    h1_bb_min_ep: float = 1.5      # Very low - bench players score less in SGW
-    h1_fh_min_gap: float = 6.0     # Lower to ensure usage 
+    h1_tc_min_ep: float = 7.5  # Lower threshold since no DGWs
+    h1_bb_min_ep: float = 1.5  # Very low - bench players score less in SGW
+    h1_fh_min_gap: float = 6.0  # Lower to ensure usage
     h1_wc_preferred_gws: Set[int] = field(default_factory=lambda: {8, 9, 14, 15})
-    
+
     # Second Half (GW20-38) - DGWs/BGWs expected, higher thresholds
     h2_tc_min_ep_sgw: float = 9.0
     h2_tc_min_ep_dgw: float = 14.0
     h2_bb_min_ep_sgw: float = 12.0
     h2_bb_min_ep_dgw: float = 18.0
-    h2_fh_bgw_threshold: int = 6    # Use FH if <=6 players have fixtures
+    h2_fh_bgw_threshold: int = 6  # Use FH if <=6 players have fixtures
     h2_wc_preferred_gws: Set[int] = field(default_factory=lambda: {28, 29, 30, 31})
-    
+
     # General settings
     bb_min_xmins: float = 60.0
     bb_min_players: int = 3
-    
+
     # Urgency factors (increase as deadline approaches)
     h1_urgency_boost_gw17: float = 0.15  # 15% threshold reduction
-    h1_urgency_boost_gw18: float = 0.25  # 25% threshold reduction  
+    h1_urgency_boost_gw18: float = 0.25  # 25% threshold reduction
     h1_urgency_boost_gw19: float = 0.40  # 40% threshold reduction
 
 
 class ChipType(Enum):
     """Chip types with H1/H2 designation"""
+
     H1_TRIPLE_CAPTAIN = "H1_TC"
     H1_BENCH_BOOST = "H1_BB"
     H1_FREE_HIT = "H1_FH"
@@ -72,6 +170,7 @@ class ChipType(Enum):
 @dataclass
 class ChipRecommendation:
     """Chip recommendation with reasoning"""
+
     chip_type: ChipType
     gameweek: int
     expected_value: float
@@ -83,25 +182,46 @@ class ChipRecommendation:
 
 # ----------------------------- Main Strategy Class -----------------------------
 
-class FPL2025ChipStrategy:
+
+class ChipStrategy:
     """
-    Chip strategy for FPL 2025/26 with double chips system
+    Chip strategy for the two-set chip system: one set per half of the season.
     """
-    
-    def __init__(self, config: ChipStrategy2025Config = None):
-        self.config = config or ChipStrategy2025Config()
-        self.h1_deadline = 19
-        self.h2_start = 20
+
+    def __init__(
+        self,
+        config: ChipStrategyConfig | None = None,
+        windows: ChipWindows | None = None,
+    ):
+        self.config = config or ChipStrategyConfig()
+        self.windows = windows or load_chip_windows()
+        self.h1_deadline = self.windows.h1_deadline
+        self.h2_start = self.windows.h2_start
         self._detected_dgws: List[int] = []
         self._detected_bgws: List[int] = []
         self._outstanding_fixtures: Dict[str, int] = {}
-        
+
+    def _deadline_date(self, gw: int) -> str:
+        """Calendar date of a gameweek's deadline, from the API rather than hardcoded."""
+        try:
+            for ev in get_bootstrap().get("events", []):
+                if int(ev["id"]) == int(gw) and ev.get("deadline_time"):
+                    return pd.to_datetime(ev["deadline_time"]).strftime("%-d %b")
+        except Exception:
+            pass
+        return "date unknown"
+
+    def _chip_start(self, half: str, code: str, current_gw: int) -> int:
+        """Earliest gameweek a chip may be played, never earlier than the current one."""
+        floor = self.h2_start if half == "H2" else 1
+        return max(current_gw, self.windows.earliest(half, code, floor))
+
     def plan_chips(
         self,
         use_myteam: bool = True,
         current_gw: Optional[int] = None,
         explain: bool = True,
-        show_teams: bool = False
+        show_teams: bool = False,
     ) -> Dict[str, ChipRecommendation]:
         """
         Generate chip strategy for the season
@@ -124,38 +244,31 @@ class FPL2025ChipStrategy:
 
         # Plan H1 chips if still in first half
         if current_gw <= self.h1_deadline:
-            h1_recs = self._plan_h1_chips(
-                current_gw,
-                owned_ids,
-                player_data
-            )
+            h1_recs = self._plan_h1_chips(current_gw, owned_ids, player_data)
             recommendations.update(h1_recs)
 
         # Always plan H2 chips for reference
-        h2_recs = self._plan_h2_chips(
-            max(current_gw, self.h2_start),
-            owned_ids,
-            player_data
-        )
+        h2_recs = self._plan_h2_chips(max(current_gw, self.h2_start), owned_ids, player_data)
         recommendations.update(h2_recs)
 
         # Filter out chips that have already been used
         recommendations = {
-            chip_key: rec
-            for chip_key, rec in recommendations.items()
-            if chip_key not in used_chips
+            chip_key: rec for chip_key, rec in recommendations.items() if chip_key not in used_chips
         }
 
         if explain:
-            self._explain_strategy(recommendations, current_gw, show_teams=show_teams, used_chips=used_chips)
+            self._explain_strategy(
+                recommendations,
+                current_gw,
+                show_teams=show_teams,
+                used_chips=used_chips,
+                owned_ids=owned_ids,
+            )
 
         return recommendations
-    
+
     def _plan_h1_chips(
-        self,
-        current_gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame
+        self, current_gw: int, owned_ids: Set[int], player_data: pd.DataFrame
     ) -> Dict[str, ChipRecommendation]:
         """
         Plan first half chips using fixture-based per-GW EP predictions
@@ -169,7 +282,13 @@ class FPL2025ChipStrategy:
         potential_chips = []
 
         # 1. Find best TC options (top 3 player+GW combinations with haul potential)
-        tc_options = self._find_best_tc_options(owned_ids, player_data, current_gw, self.h1_deadline, top_n=3)
+        tc_options = self._find_best_tc_options(
+            owned_ids,
+            player_data,
+            self._chip_start("H1", "TC", current_gw),
+            self.h1_deadline,
+            top_n=3,
+        )
         for option in tc_options:
             # Describe haul potential
             haul_desc = {
@@ -177,102 +296,130 @@ class FPL2025ChipStrategy:
                 (1.2, 1.5): "high haul potential",
                 (1.0, 1.2): "good haul potential",
                 (0.8, 1.0): "moderate ceiling",
-                (0.0, 0.8): "consistent scorer"
+                (0.0, 0.8): "consistent scorer",
             }
-            haul_text = next((v for k, v in haul_desc.items() if k[0] <= option['haul_factor'] < k[1]), "")
+            haul_text = next(
+                (v for k, v in haul_desc.items() if k[0] <= option["haul_factor"] < k[1]), ""
+            )
 
-            potential_chips.append(ChipRecommendation(
-                chip_type=ChipType.H1_TRIPLE_CAPTAIN,
-                gameweek=option['gw'],
-                expected_value=option['tc_score'] * 3,  # Use TC score for sorting
-                confidence=min(0.9, option['tc_score'] / 12),
-                urgency=urgency,
-                reasons=[
-                    f"{option['player_name']} expected {option['ep']:.1f} points",
-                    f"Haul factor: {option['haul_factor']:.2f}x ({haul_text})",
-                    "Best fixture-adjusted TC option"
-                ],
-                player_targets=[option['player_name']]
-            ))
+            potential_chips.append(
+                ChipRecommendation(
+                    chip_type=ChipType.H1_TRIPLE_CAPTAIN,
+                    gameweek=option["gw"],
+                    expected_value=option["tc_score"] * 3,  # Use TC score for sorting
+                    confidence=min(0.9, option["tc_score"] / 12),
+                    urgency=urgency,
+                    reasons=[
+                        f"{option['player_name']} expected {option['ep']:.1f} points",
+                        f"Haul factor: {option['haul_factor']:.2f}x ({haul_text})",
+                        "Best fixture-adjusted TC option",
+                    ],
+                    player_targets=[option["player_name"]],
+                )
+            )
 
         # 2. Find best BB options (top 3 gameweeks)
-        bb_options = self._find_best_bb_options(owned_ids, player_data, current_gw, self.h1_deadline, top_n=3)
+        bb_options = self._find_best_bb_options(
+            owned_ids,
+            player_data,
+            self._chip_start("H1", "BB", current_gw),
+            self.h1_deadline,
+            top_n=3,
+        )
         for option in bb_options:
-            potential_chips.append(ChipRecommendation(
-                chip_type=ChipType.H1_BENCH_BOOST,
-                gameweek=option['gw'],
-                expected_value=option['bench_ep'],
-                confidence=min(0.85, option['bench_ep'] / 8),
-                urgency=urgency,
-                reasons=[
-                    f"Bench expected {option['bench_ep']:.1f} points",
-                    f"{option['num_playing']}/4 bench players likely to play"
-                ]
-            ))
+            potential_chips.append(
+                ChipRecommendation(
+                    chip_type=ChipType.H1_BENCH_BOOST,
+                    gameweek=option["gw"],
+                    expected_value=option["bench_ep"],
+                    confidence=min(0.85, option["bench_ep"] / 8),
+                    urgency=urgency,
+                    reasons=[
+                        f"Bench expected {option['bench_ep']:.1f} points",
+                        f"{option['num_playing']}/4 bench players likely to play",
+                    ],
+                )
+            )
 
         # 3. Find best FH options (top 3 gameweeks by gap)
-        fh_options = self._find_best_fh_options(owned_ids, player_data, current_gw, self.h1_deadline, top_n=3)
+        fh_options = self._find_best_fh_options(
+            owned_ids,
+            player_data,
+            self._chip_start("H1", "FH", current_gw),
+            self.h1_deadline,
+            top_n=3,
+        )
         for option in fh_options:
-            potential_chips.append(ChipRecommendation(
-                chip_type=ChipType.H1_FREE_HIT,
-                gameweek=option['gw'],
-                expected_value=option['gap'],
-                confidence=min(0.9, option['gap'] / 15),
-                urgency=urgency,
-                reasons=[
-                    f"Can gain {option['gap']:.1f} points vs current team",
-                    f"Owned XI: {option['owned_xi_ep']:.1f}, Optimal XI: {option['optimal_xi_ep']:.1f}"
-                ]
-            ))
+            potential_chips.append(
+                ChipRecommendation(
+                    chip_type=ChipType.H1_FREE_HIT,
+                    gameweek=option["gw"],
+                    expected_value=option["gap"],
+                    confidence=min(0.9, option["gap"] / 15),
+                    urgency=urgency,
+                    reasons=[
+                        f"Can gain {option['gap']:.1f} points vs current team",
+                        f"Owned XI: {option['owned_xi_ep']:.1f}, Optimal XI: {option['optimal_xi_ep']:.1f}",
+                    ],
+                )
+            )
 
         # 4. Add WC option
-        wc_gw = self._find_h1_wildcard_gw(current_gw)
+        wc_gw = self._find_h1_wildcard_gw(self._chip_start("H1", "WC", current_gw))
         if wc_gw:
-            potential_chips.append(ChipRecommendation(
-                chip_type=ChipType.H1_WILDCARD,
-                gameweek=wc_gw,
-                expected_value=10,  # Give WC some value for sorting
-                confidence=0.8,
-                urgency=0.3 if current_gw < 15 else 0.7,
-                reasons=[
-                    f"International break in GW{wc_gw}" if wc_gw in {4, 8, 12} else "Fixture swing opportunity",
-                    "Time to restructure team mid-H1"
-                ]
-            ))
-        
+            potential_chips.append(
+                ChipRecommendation(
+                    chip_type=ChipType.H1_WILDCARD,
+                    gameweek=wc_gw,
+                    expected_value=10,  # Give WC some value for sorting
+                    confidence=0.8,
+                    urgency=0.3 if current_gw < 15 else 0.7,
+                    reasons=[
+                        f"International break before GW{wc_gw}"
+                        if wc_gw in self._detect_international_break_gws()
+                        else "Fixture swing opportunity",
+                        "Time to restructure team mid-H1",
+                    ],
+                )
+            )
+
         # Sort by priority: expected_value * confidence
-        potential_chips.sort(
-            key=lambda x: x.expected_value * x.confidence,
-            reverse=True
-        )
-        
+        potential_chips.sort(key=lambda x: x.expected_value * x.confidence, reverse=True)
+
         # Assign chips avoiding conflicts
-        chips_assigned = {'TC': False, 'BB': False, 'FH': False, 'WC': False}
-        
+        chips_assigned = {"TC": False, "BB": False, "FH": False, "WC": False}
+
         for chip in potential_chips:
             if chip.gameweek not in occupied_gws:
-                chip_key = chip.chip_type.value.split('_')[1]  # Get TC, BB, FH, or WC
+                chip_key = chip.chip_type.value.split("_")[1]  # Get TC, BB, FH, or WC
                 if not chips_assigned[chip_key]:
                     recs[chip.chip_type.value] = chip
                     occupied_gws.add(chip.gameweek)
                     chips_assigned[chip_key] = True
-        
+
         # If approaching deadline and chips not assigned, force them
-        if current_gw >= 17:
-            remaining_gws = [gw for gw in range(current_gw, self.h1_deadline + 1) 
-                           if gw not in occupied_gws]
-            
+        if current_gw >= self.h1_deadline - 2:
+            remaining_gws = [
+                gw for gw in range(current_gw, self.h1_deadline + 1) if gw not in occupied_gws
+            ]
+
             # Map short codes to full enum names
             chip_name_map = {
-                'TC': 'TRIPLE_CAPTAIN',
-                'BB': 'BENCH_BOOST',
-                'FH': 'FREE_HIT',
-                'WC': 'WILDCARD'
+                "TC": "TRIPLE_CAPTAIN",
+                "BB": "BENCH_BOOST",
+                "FH": "FREE_HIT",
+                "WC": "WILDCARD",
             }
-            for chip_key in ['TC', 'BB', 'FH', 'WC']:
+            for chip_key in ["TC", "BB", "FH", "WC"]:
                 if not chips_assigned[chip_key] and remaining_gws:
-                    gw = remaining_gws.pop(0)
-                    chip_type = getattr(ChipType, f'H1_{chip_name_map[chip_key]}')
+                    # Only force a chip into a gameweek where it is actually playable.
+                    earliest = self.windows.earliest("H1", chip_key, 1)
+                    playable = [gw for gw in remaining_gws if gw >= earliest]
+                    if not playable:
+                        continue
+                    gw = playable[0]
+                    remaining_gws.remove(gw)
+                    chip_type = getattr(ChipType, f"H1_{chip_name_map[chip_key]}")
                     recs[chip_type.value] = ChipRecommendation(
                         chip_type=chip_type,
                         gameweek=gw,
@@ -281,18 +428,15 @@ class FPL2025ChipStrategy:
                         urgency=1.0,
                         reasons=[
                             f"⚠️ URGENT: Only {self.h1_deadline - current_gw + 1} GWs left!",
-                            "Use it or lose it!"
-                        ]
+                            "Use it or lose it!",
+                        ],
                     )
                     occupied_gws.add(gw)
-        
+
         return recs
-    
+
     def _plan_h2_chips(
-        self,
-        current_gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame
+        self, current_gw: int, owned_ids: Set[int], player_data: pd.DataFrame
     ) -> Dict[str, ChipRecommendation]:
         """
         Plan second half chips using scenario-based sequencing.
@@ -340,7 +484,7 @@ class FPL2025ChipStrategy:
             boot = get_bootstrap()
 
             # Map player_id → team_id
-            pid_to_team = {p['id']: p['team'] for p in boot.get('elements', [])}
+            pid_to_team = {p["id"]: p["team"] for p in boot.get("elements", [])}
             owned_teams = {pid_to_team[pid] for pid in owned_ids if pid in pid_to_team}
 
             best_bgw = bgws[0]
@@ -350,9 +494,9 @@ class FPL2025ChipStrategy:
                 # Teams with a fixture in this GW
                 teams_playing = set()
                 for f in fixtures:
-                    if f.get('event') == gw:
-                        teams_playing.add(f['team_h'])
-                        teams_playing.add(f['team_a'])
+                    if f.get("event") == gw:
+                        teams_playing.add(f["team_h"])
+                        teams_playing.add(f["team_a"])
 
                 # How many of our players' teams are playing?
                 coverage = len(owned_teams & teams_playing)
@@ -373,7 +517,7 @@ class FPL2025ChipStrategy:
             expected_value=0,
             confidence=0.0,
             urgency=0.0,
-            reasons=[reason]
+            reasons=[reason],
         )
 
     def _sequence_scenario_a(
@@ -382,7 +526,7 @@ class FPL2025ChipStrategy:
         owned_ids: Set[int],
         player_data: pd.DataFrame,
         dgws: List[int],
-        bgws: List[int]
+        bgws: List[int],
     ) -> Dict[str, ChipRecommendation]:
         """Scenario A: BGWs + DGWs confirmed.
 
@@ -393,7 +537,7 @@ class FPL2025ChipStrategy:
 
         # 1. FH on worst-coverage BGW
         fh_gw = self._score_bgw_for_fh(bgws, owned_ids)
-        recs['H2_FH'] = ChipRecommendation(
+        recs["H2_FH"] = ChipRecommendation(
             chip_type=ChipType.H2_FREE_HIT,
             gameweek=fh_gw,
             expected_value=40,
@@ -402,14 +546,14 @@ class FPL2025ChipStrategy:
             reasons=[
                 f"Blank GW{fh_gw} — limited fixtures",
                 "Maximise playing XI on a blank gameweek",
-            ]
+            ],
         )
         occupied_gws.add(fh_gw)
 
         # 2. WC to rebuild after FH
         wc_gw = self._find_h2_wildcard_gw(dgws, fh_gw=fh_gw, excluded_gws=occupied_gws)
         if wc_gw:
-            recs['H2_WC'] = ChipRecommendation(
+            recs["H2_WC"] = ChipRecommendation(
                 chip_type=ChipType.H2_WILDCARD,
                 gameweek=wc_gw,
                 expected_value=0,
@@ -418,17 +562,19 @@ class FPL2025ChipStrategy:
                 reasons=[
                     f"Rebuild squad after Free Hit on GW{fh_gw}",
                     "Position for upcoming DGWs",
-                ]
+                ],
             )
             occupied_gws.add(wc_gw)
 
         # 3. TC on best DGW
-        best_dgw = self._find_best_captain_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        best_dgw = self._find_best_captain_dgw(
+            dgws, owned_ids, player_data, excluded_gws=occupied_gws
+        )
         if best_dgw:
-            recs['H2_TC'] = ChipRecommendation(
+            recs["H2_TC"] = ChipRecommendation(
                 chip_type=ChipType.H2_TRIPLE_CAPTAIN,
-                gameweek=best_dgw['gw'],
-                expected_value=best_dgw['ep'] * 3,
+                gameweek=best_dgw["gw"],
+                expected_value=best_dgw["ep"] * 3,
                 confidence=0.9,
                 urgency=0.1 if current_gw < 30 else 0.5,
                 reasons=[
@@ -436,44 +582,42 @@ class FPL2025ChipStrategy:
                     f"Expected {best_dgw['ep']:.1f} points (captained)",
                     "Premium DGW opportunity",
                 ],
-                player_targets=[best_dgw['player']]
+                player_targets=[best_dgw["player"]],
             )
-            occupied_gws.add(best_dgw['gw'])
+            occupied_gws.add(best_dgw["gw"])
         else:
-            recs['H2_TC'] = self._make_hold(
+            recs["H2_TC"] = self._make_hold(
                 ChipType.H2_TRIPLE_CAPTAIN,
-                "No available DGW for TC — HOLD pending fixture announcements"
+                "No available DGW for TC — HOLD pending fixture announcements",
             )
 
         # 4. BB on a different DGW
-        best_bb = self._find_best_bench_boost_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        best_bb = self._find_best_bench_boost_dgw(
+            dgws, owned_ids, player_data, excluded_gws=occupied_gws
+        )
         if best_bb:
-            label = "Double gameweek" if best_bb['dgw_players'] > 0 else "Best remaining gameweek"
-            recs['H2_BB'] = ChipRecommendation(
+            label = "Double gameweek" if best_bb["dgw_players"] > 0 else "Best remaining gameweek"
+            recs["H2_BB"] = ChipRecommendation(
                 chip_type=ChipType.H2_BENCH_BOOST,
-                gameweek=best_bb['gw'],
-                expected_value=best_bb['bench_ep'],
-                confidence=0.85 if best_bb['dgw_players'] > 0 else 0.6,
+                gameweek=best_bb["gw"],
+                expected_value=best_bb["bench_ep"],
+                confidence=0.85 if best_bb["dgw_players"] > 0 else 0.6,
                 urgency=0.1 if current_gw < 30 else 0.5,
                 reasons=[
                     f"{label} for bench players",
                     f"Bench expected {best_bb['bench_ep']:.1f} points",
-                ]
+                ],
             )
         else:
-            recs['H2_BB'] = self._make_hold(
+            recs["H2_BB"] = self._make_hold(
                 ChipType.H2_BENCH_BOOST,
-                "No suitable GW for BB — HOLD pending fixture announcements"
+                "No suitable GW for BB — HOLD pending fixture announcements",
             )
 
         return recs
 
     def _sequence_scenario_b(
-        self,
-        current_gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame,
-        bgws: List[int]
+        self, current_gw: int, owned_ids: Set[int], player_data: pd.DataFrame, bgws: List[int]
     ) -> Dict[str, ChipRecommendation]:
         """Scenario B: BGWs only, no DGWs confirmed.
 
@@ -484,7 +628,7 @@ class FPL2025ChipStrategy:
 
         # 1. FH on worst-coverage BGW
         fh_gw = self._score_bgw_for_fh(bgws, owned_ids)
-        recs['H2_FH'] = ChipRecommendation(
+        recs["H2_FH"] = ChipRecommendation(
             chip_type=ChipType.H2_FREE_HIT,
             gameweek=fh_gw,
             expected_value=40,
@@ -493,14 +637,14 @@ class FPL2025ChipStrategy:
             reasons=[
                 f"Blank GW{fh_gw} — limited fixtures",
                 "Maximise playing XI on a blank gameweek",
-            ]
+            ],
         )
         occupied_gws.add(fh_gw)
 
         # 2. WC to rebuild after FH
         wc_gw = self._find_h2_wildcard_gw([], fh_gw=fh_gw, excluded_gws=occupied_gws)
         if wc_gw:
-            recs['H2_WC'] = ChipRecommendation(
+            recs["H2_WC"] = ChipRecommendation(
                 chip_type=ChipType.H2_WILDCARD,
                 gameweek=wc_gw,
                 expected_value=0,
@@ -509,30 +653,24 @@ class FPL2025ChipStrategy:
                 reasons=[
                     f"Rebuild squad after Free Hit on GW{fh_gw}",
                     "No DGWs confirmed yet — rebuild for run-in",
-                ]
+                ],
             )
             occupied_gws.add(wc_gw)
 
         # 3. TC — HOLD (no DGWs)
-        recs['H2_TC'] = self._make_hold(
-            ChipType.H2_TRIPLE_CAPTAIN,
-            "No DGWs confirmed — HOLD for future DGW announcement"
+        recs["H2_TC"] = self._make_hold(
+            ChipType.H2_TRIPLE_CAPTAIN, "No DGWs confirmed — HOLD for future DGW announcement"
         )
 
         # 4. BB — HOLD (no DGWs)
-        recs['H2_BB'] = self._make_hold(
-            ChipType.H2_BENCH_BOOST,
-            "No DGWs confirmed — HOLD for future DGW announcement"
+        recs["H2_BB"] = self._make_hold(
+            ChipType.H2_BENCH_BOOST, "No DGWs confirmed — HOLD for future DGW announcement"
         )
 
         return recs
 
     def _sequence_scenario_c(
-        self,
-        current_gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame,
-        dgws: List[int]
+        self, current_gw: int, owned_ids: Set[int], player_data: pd.DataFrame, dgws: List[int]
     ) -> Dict[str, ChipRecommendation]:
         """Scenario C: DGWs only, no BGWs.
 
@@ -544,7 +682,7 @@ class FPL2025ChipStrategy:
         # 1. WC to prepare for DGWs
         wc_gw = self._find_h2_wildcard_gw(dgws, excluded_gws=occupied_gws)
         if wc_gw:
-            recs['H2_WC'] = ChipRecommendation(
+            recs["H2_WC"] = ChipRecommendation(
                 chip_type=ChipType.H2_WILDCARD,
                 gameweek=wc_gw,
                 expected_value=0,
@@ -553,17 +691,19 @@ class FPL2025ChipStrategy:
                 reasons=[
                     "Position squad before DGW run",
                     "Build squad for TC/BB potential",
-                ]
+                ],
             )
             occupied_gws.add(wc_gw)
 
         # 2. TC on best DGW
-        best_dgw = self._find_best_captain_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        best_dgw = self._find_best_captain_dgw(
+            dgws, owned_ids, player_data, excluded_gws=occupied_gws
+        )
         if best_dgw:
-            recs['H2_TC'] = ChipRecommendation(
+            recs["H2_TC"] = ChipRecommendation(
                 chip_type=ChipType.H2_TRIPLE_CAPTAIN,
-                gameweek=best_dgw['gw'],
-                expected_value=best_dgw['ep'] * 3,
+                gameweek=best_dgw["gw"],
+                expected_value=best_dgw["ep"] * 3,
                 confidence=0.9,
                 urgency=0.1 if current_gw < 30 else 0.5,
                 reasons=[
@@ -571,30 +711,31 @@ class FPL2025ChipStrategy:
                     f"Expected {best_dgw['ep']:.1f} points (captained)",
                     "Premium DGW opportunity",
                 ],
-                player_targets=[best_dgw['player']]
+                player_targets=[best_dgw["player"]],
             )
-            occupied_gws.add(best_dgw['gw'])
+            occupied_gws.add(best_dgw["gw"])
 
         # 3. BB on different DGW (or SGW fallback)
-        best_bb = self._find_best_bench_boost_dgw(dgws, owned_ids, player_data, excluded_gws=occupied_gws)
+        best_bb = self._find_best_bench_boost_dgw(
+            dgws, owned_ids, player_data, excluded_gws=occupied_gws
+        )
         if best_bb:
-            label = "Double gameweek" if best_bb['dgw_players'] > 0 else "Best remaining gameweek"
-            recs['H2_BB'] = ChipRecommendation(
+            label = "Double gameweek" if best_bb["dgw_players"] > 0 else "Best remaining gameweek"
+            recs["H2_BB"] = ChipRecommendation(
                 chip_type=ChipType.H2_BENCH_BOOST,
-                gameweek=best_bb['gw'],
-                expected_value=best_bb['bench_ep'],
-                confidence=0.85 if best_bb['dgw_players'] > 0 else 0.6,
+                gameweek=best_bb["gw"],
+                expected_value=best_bb["bench_ep"],
+                confidence=0.85 if best_bb["dgw_players"] > 0 else 0.6,
                 urgency=0.1 if current_gw < 30 else 0.5,
                 reasons=[
                     f"{label} for bench players",
                     f"Bench expected {best_bb['bench_ep']:.1f} points",
-                ]
+                ],
             )
 
         # 4. FH — HOLD (no BGWs)
-        recs['H2_FH'] = self._make_hold(
-            ChipType.H2_FREE_HIT,
-            "No BGWs confirmed — HOLD for future BGW announcement"
+        recs["H2_FH"] = self._make_hold(
+            ChipType.H2_FREE_HIT, "No BGWs confirmed — HOLD for future BGW announcement"
         )
 
         return recs
@@ -602,34 +743,31 @@ class FPL2025ChipStrategy:
     def _sequence_scenario_d(self) -> Dict[str, ChipRecommendation]:
         """Scenario D: No BGWs or DGWs confirmed. All HOLD."""
         return {
-            'H2_FH': self._make_hold(
-                ChipType.H2_FREE_HIT,
-                "No BGWs confirmed — HOLD pending fixture announcements"
+            "H2_FH": self._make_hold(
+                ChipType.H2_FREE_HIT, "No BGWs confirmed — HOLD pending fixture announcements"
             ),
-            'H2_WC': self._make_hold(
-                ChipType.H2_WILDCARD,
-                "No BGWs/DGWs confirmed — HOLD pending fixture announcements"
+            "H2_WC": self._make_hold(
+                ChipType.H2_WILDCARD, "No BGWs/DGWs confirmed — HOLD pending fixture announcements"
             ),
-            'H2_TC': self._make_hold(
-                ChipType.H2_TRIPLE_CAPTAIN,
-                "No DGWs confirmed — HOLD pending fixture announcements"
+            "H2_TC": self._make_hold(
+                ChipType.H2_TRIPLE_CAPTAIN, "No DGWs confirmed — HOLD pending fixture announcements"
             ),
-            'H2_BB': self._make_hold(
-                ChipType.H2_BENCH_BOOST,
-                "No DGWs confirmed — HOLD pending fixture announcements"
+            "H2_BB": self._make_hold(
+                ChipType.H2_BENCH_BOOST, "No DGWs confirmed — HOLD pending fixture announcements"
             ),
         }
-    
+
     def _calculate_h1_urgency(self, current_gw: int) -> float:
-        """Calculate urgency factor for H1 chips"""
-        if current_gw >= 19:
-            return 0.5  # Maximum urgency at deadline
-        elif current_gw >= 18:
+        """Urgency factor for H1 chips, measured in gameweeks left before they expire."""
+        gws_left = self.h1_deadline - current_gw
+        if gws_left <= 0:
+            return self.config.h1_urgency_boost_gw19  # Maximum urgency at the deadline itself
+        if gws_left == 1:
             return self.config.h1_urgency_boost_gw18
-        elif current_gw >= 17:
+        if gws_left == 2:
             return self.config.h1_urgency_boost_gw17
         return 0.0
-    
+
     def _predict_dgw_bgw(self) -> Tuple[List[int], List[int]]:
         """
         Detect DGWs and BGWs from actual FPL fixture data.
@@ -688,10 +826,14 @@ class FPL2025ChipStrategy:
                     outstanding = remaining_expected - count
                     team_name = teams_map.get(tid, f"Team {tid}")
                     self._outstanding_fixtures[team_name] = outstanding
-                    log.info(f"{team_name}: {count}/{remaining_expected} fixtures scheduled ({outstanding} outstanding)")
+                    log.info(
+                        f"{team_name}: {count}/{remaining_expected} fixtures scheduled ({outstanding} outstanding)"
+                    )
 
             if unscheduled_fixtures:
-                log.info(f"{len(unscheduled_fixtures)} unscheduled fixture(s) — will produce future DGWs")
+                log.info(
+                    f"{len(unscheduled_fixtures)} unscheduled fixture(s) — will produce future DGWs"
+                )
                 for f in unscheduled_fixtures:
                     home = teams_map.get(f.get("team_h"), "?")
                     away = teams_map.get(f.get("team_a"), "?")
@@ -706,20 +848,20 @@ class FPL2025ChipStrategy:
             log.warning(f"Could not fetch fixtures for DGW/BGW detection: {e}")
             self._outstanding_fixtures = {}
             return [], []
-    
+
     def _get_current_gw(self) -> int:
         """Get current gameweek from API"""
         boot = get_bootstrap()
         events = boot.get("events", [])
-        
+
         for ev in events:
             if ev.get("is_next"):
                 return int(ev["id"])
             elif ev.get("is_current"):
                 return int(ev["id"])
-        
+
         return 1
-    
+
     def _load_myteam(self) -> Set[int]:
         """Load user's team"""
         try:
@@ -759,7 +901,7 @@ class FPL2025ChipStrategy:
                     # Map API chip names to our internal names
                     # Check if it's H1 or H2 based on start_event
                     start_event = chip.get("start_event", 1)
-                    half = "H1" if start_event < 20 else "H2"
+                    half = "H1" if start_event < self.h2_start else "H2"
 
                     if name == "wildcard":
                         used_chips.add(f"{half}_WC")
@@ -774,38 +916,70 @@ class FPL2025ChipStrategy:
         except Exception as e:
             log.warning(f"Could not load used chips: {e}")
             return set()
-    
+
     def _load_player_data(self) -> pd.DataFrame:
         """Load player EP data"""
         try:
             ep_df = read_parquet(PROC / "exp_points.parquet")
             xmins_df = read_parquet(PROC / "xmins.parquet")
-            
+
             # Merge data
-            df = ep_df.merge(xmins_df, on='player_id', how='left')
-            
+            df = ep_df.merge(xmins_df, on="player_id", how="left")
+
             # Add player info from bootstrap
             boot = get_bootstrap()
             players = []
-            for p in boot.get('elements', []):
-                players.append({
-                    'player_id': p['id'],
-                    'name': p['web_name'],
-                    'team': p['team'],
-                    'position': p['element_type'],
-                    'cost': p['now_cost'] / 10
-                })
-            
+            for p in boot.get("elements", []):
+                players.append(
+                    {
+                        "player_id": p["id"],
+                        "name": p["web_name"],
+                        "team": p["team"],
+                        "position": p["element_type"],
+                        "cost": p["now_cost"] / 10,
+                    }
+                )
+
             players_df = pd.DataFrame(players)
-            df = df.merge(players_df, on='player_id', how='left')
-            
+            df = df.merge(players_df, on="player_id", how="left")
+
             return df
         except:
             return pd.DataFrame()
-    
+
+    def _detect_international_break_gws(self) -> Set[int]:
+        """Gameweeks whose deadline follows an international break.
+
+        FPL doesn't mark breaks explicitly, but a gap between one gameweek's deadline and the
+        next of roughly 12+ days (a normal gap is 6-8) is one: the fixture list clears for
+        internationals, then resumes the following weekend. Detected from live deadline_time
+        data rather than hardcoded gameweek numbers, which drift every season as the calendar
+        (and any mid-season tournament, e.g. a winter World Cup) shifts.
+        """
+        import datetime as _dt
+
+        events = sorted(get_bootstrap().get("events", []), key=lambda e: e["id"])
+        breaks = set()
+        for prev, cur in zip(events, events[1:]):
+            try:
+                d_prev = _dt.datetime.fromisoformat(prev["deadline_time"].replace("Z", "+00:00"))
+                d_cur = _dt.datetime.fromisoformat(cur["deadline_time"].replace("Z", "+00:00"))
+            except (KeyError, ValueError, TypeError):
+                continue
+            if (d_cur - d_prev).days >= 12:
+                breaks.add(cur["id"])
+        return breaks
+
     def _find_h1_wildcard_gw(self, current_gw: int) -> Optional[int]:
         """Find optimal H1 wildcard GW"""
-        # Prefer international breaks or mid-H1
+        # Prefer a gameweek right after an international break: squads are freshest to assess
+        # (injuries/rotation/form clarify) right when everyone's back from duty.
+        breaks = self._detect_international_break_gws()
+        preferred = sorted(gw for gw in breaks if current_gw <= gw <= self.h1_deadline)
+        if preferred:
+            return preferred[0]
+
+        # No break left in the window — fall back to the configured preference, then mid-H1.
         preferred = [gw for gw in self.config.h1_wc_preferred_gws if gw >= current_gw]
         if preferred:
             return min(preferred)
@@ -819,10 +993,7 @@ class FPL2025ChipStrategy:
         return None
 
     def _calculate_per_gw_ep(
-        self,
-        player_data: pd.DataFrame,
-        gw_start: int,
-        gw_end: int
+        self, player_data: pd.DataFrame, gw_start: int, gw_end: int
     ) -> Dict[int, Dict[int, float]]:
         """
         Calculate expected points for each player for each gameweek.
@@ -833,30 +1004,30 @@ class FPL2025ChipStrategy:
             # Load FDR data
             fdr_df = read_parquet(PROC / "fdr.parquet")
             future_fixtures = fdr_df[
-                (fdr_df['is_future'] == True) &
-                (fdr_df['event'].notna()) &
-                (fdr_df['event'] >= gw_start) &
-                (fdr_df['event'] <= gw_end)
+                (fdr_df["is_future"] == True)
+                & (fdr_df["event"].notna())
+                & (fdr_df["event"] >= gw_start)
+                & (fdr_df["event"] <= gw_end)
             ].copy()
 
             # Map team IDs to names
             boot = get_bootstrap()
-            team_id_to_name = {t['id']: t['name'] for t in boot['teams']}
+            team_id_to_name = {t["id"]: t["name"] for t in boot["teams"]}
 
             # Build player_id -> team_name mapping
             player_teams = {}
-            for p in boot['elements']:
-                team_name = team_id_to_name.get(p['team'])
+            for p in boot["elements"]:
+                team_name = team_id_to_name.get(p["team"])
                 if team_name:
-                    player_teams[p['id']] = team_name
+                    player_teams[p["id"]] = team_name
 
             # Initialize per-GW EP dict
             per_gw_ep = defaultdict(dict)
 
             # For each player in player_data
             for _, player in player_data.iterrows():
-                pid = player['player_id']
-                base_ep = player.get('ep_blend', player.get('ep_adjusted', 0))
+                pid = player["player_id"]
+                base_ep = player.get("ep_adjusted", player.get("ep_blend", 0))
                 team_name = player_teams.get(pid)
 
                 if not team_name or base_ep <= 0:
@@ -864,19 +1035,19 @@ class FPL2025ChipStrategy:
 
                 # Get fixtures for this player's team
                 team_fixtures = future_fixtures[
-                    (future_fixtures['home_team'] == team_name) |
-                    (future_fixtures['away_team'] == team_name)
+                    (future_fixtures["home_team"] == team_name)
+                    | (future_fixtures["away_team"] == team_name)
                 ].copy()
 
                 # For each fixture, calculate adjusted EP
                 for _, fixture in team_fixtures.iterrows():
-                    gw = int(fixture['event'])
-                    is_home = fixture['home_team'] == team_name
+                    gw = int(fixture["event"])
+                    is_home = fixture["home_team"] == team_name
 
                     # FDR ranges from 0 (easiest) to 1 (hardest)
                     # Lower FDR = easier fixture = higher EP
                     # Higher FDR = harder fixture = lower EP
-                    fdr = fixture['fdr_home'] if is_home else fixture['fdr_away']
+                    fdr = fixture["fdr_home"] if is_home else fixture["fdr_away"]
 
                     # INVERT FDR: 1.0 - fdr so that:
                     # Easy fixture (FDR 0.3) → inverted 0.7 → multiplier 1.12 (+12%)
@@ -911,7 +1082,7 @@ class FPL2025ChipStrategy:
         mids: List[Dict],
         fwds: List[Dict],
         remaining_budget: float,
-        total_budget: float
+        total_budget: float,
     ) -> Tuple[List[Dict], List[Dict], float, float]:
         """
         Upgrade squad to use remaining budget efficiently.
@@ -927,20 +1098,20 @@ class FPL2025ChipStrategy:
 
         # Get all current player IDs and team counts
         all_current = current_xi + current_bench
-        selected_ids = {p['id'] for p in all_current}
+        selected_ids = {p["id"] for p in all_current}
         team_counts = {}
         for p in all_current:
-            team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
+            team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
 
-        current_cost = sum(p['cost'] for p in all_current)
-        current_xi_ep = sum(p['ep'] for p in current_xi)
+        current_cost = sum(p["cost"] for p in all_current)
+        current_xi_ep = sum(p["ep"] for p in current_xi)
 
         # Pool of available players by position
         position_pools = {
-            1: [p for p in gkps if p['id'] not in selected_ids],
-            2: [p for p in defs if p['id'] not in selected_ids],
-            3: [p for p in mids if p['id'] not in selected_ids],
-            4: [p for p in fwds if p['id'] not in selected_ids]
+            1: [p for p in gkps if p["id"] not in selected_ids],
+            2: [p for p in defs if p["id"] not in selected_ids],
+            3: [p for p in mids if p["id"] not in selected_ids],
+            4: [p for p in fwds if p["id"] not in selected_ids],
         }
 
         improved = True
@@ -952,27 +1123,27 @@ class FPL2025ChipStrategy:
             # Try upgrading each player in XI and bench
             for player_list, is_xi in [(current_xi, True), (current_bench, False)]:
                 for idx, current_player in enumerate(player_list):
-                    position = current_player['position']
+                    position = current_player["position"]
 
                     # Find better alternatives
                     for alt_player in position_pools[position]:
                         # Check if upgrade fits budget
-                        cost_diff = alt_player['cost'] - current_player['cost']
+                        cost_diff = alt_player["cost"] - current_player["cost"]
                         if current_cost + cost_diff > total_budget + 0.1:
                             continue
 
                         # Check team constraint (removing old player frees up a slot)
-                        old_team_count = team_counts.get(current_player['team'], 0)
-                        new_team_count = team_counts.get(alt_player['team'], 0)
+                        old_team_count = team_counts.get(current_player["team"], 0)
+                        new_team_count = team_counts.get(alt_player["team"], 0)
 
                         # If swapping to same team, constraint is maintained
                         # If swapping to different team, new team count must be < 3
-                        if alt_player['team'] != current_player['team']:
+                        if alt_player["team"] != current_player["team"]:
                             if new_team_count >= 3:
                                 continue
 
                         # Calculate value of upgrade
-                        ep_gain = alt_player['ep'] - current_player['ep']
+                        ep_gain = alt_player["ep"] - current_player["ep"]
 
                         # For XI upgrades, we care about EP gain
                         # For bench upgrades, we care about EP gain but lower priority
@@ -982,36 +1153,36 @@ class FPL2025ChipStrategy:
                         if upgrade_value > best_upgrade_value and ep_gain > 0:
                             best_upgrade_value = upgrade_value
                             best_upgrade = {
-                                'list': player_list,
-                                'idx': idx,
-                                'old_player': current_player,
-                                'new_player': alt_player,
-                                'is_xi': is_xi,
-                                'cost_diff': cost_diff
+                                "list": player_list,
+                                "idx": idx,
+                                "old_player": current_player,
+                                "new_player": alt_player,
+                                "is_xi": is_xi,
+                                "cost_diff": cost_diff,
                             }
 
             # Apply best upgrade if found
             if best_upgrade:
-                old_p = best_upgrade['old_player']
-                new_p = best_upgrade['new_player']
+                old_p = best_upgrade["old_player"]
+                new_p = best_upgrade["new_player"]
 
                 # Update the list
-                best_upgrade['list'][best_upgrade['idx']] = new_p
+                best_upgrade["list"][best_upgrade["idx"]] = new_p
 
                 # Update tracking
-                selected_ids.remove(old_p['id'])
-                selected_ids.add(new_p['id'])
+                selected_ids.remove(old_p["id"])
+                selected_ids.add(new_p["id"])
 
-                team_counts[old_p['team']] -= 1
-                team_counts[new_p['team']] = team_counts.get(new_p['team'], 0) + 1
+                team_counts[old_p["team"]] -= 1
+                team_counts[new_p["team"]] = team_counts.get(new_p["team"], 0) + 1
 
-                current_cost += best_upgrade['cost_diff']
+                current_cost += best_upgrade["cost_diff"]
 
-                if best_upgrade['is_xi']:
-                    current_xi_ep += new_p['ep'] - old_p['ep']
+                if best_upgrade["is_xi"]:
+                    current_xi_ep += new_p["ep"] - old_p["ep"]
 
                 # Remove new player from available pool
-                position_pools[new_p['position']].remove(new_p)
+                position_pools[new_p["position"]].remove(new_p)
 
                 improved = True
 
@@ -1022,7 +1193,7 @@ class FPL2025ChipStrategy:
         gw: int,
         player_data: pd.DataFrame,
         per_gw_ep: Dict[int, Dict[int, float]],
-        budget: float = 100.0
+        budget: float = 100.0,
     ) -> Dict:
         """
         Build the optimal 15-man squad for a specific gameweek.
@@ -1048,32 +1219,42 @@ class FPL2025ChipStrategy:
 
         # Get team info
         boot = get_bootstrap()
-        team_map = {t['id']: t['name'] for t in boot['teams']}
+        team_map = {t["id"]: t["name"] for t in boot["teams"]}
 
         # Collect all players with their GW EP and team
         all_players = []
         for _, player in player_data.iterrows():
-            pid = player['player_id']
+            pid = player["player_id"]
             gw_ep = per_gw_ep.get(pid, {}).get(gw, 0)
             if gw_ep > 0:
                 # Get team from bootstrap
-                boot_player = next((p for p in boot['elements'] if p['id'] == pid), None)
-                team = team_map.get(boot_player['team']) if boot_player else 'Unknown'
+                boot_player = next((p for p in boot["elements"] if p["id"] == pid), None)
+                team = team_map.get(boot_player["team"]) if boot_player else "Unknown"
 
-                all_players.append({
-                    'id': pid,
-                    'name': player['name'],
-                    'position': player['position'],
-                    'ep': gw_ep,
-                    'cost': player['cost'],
-                    'team': team
-                })
+                all_players.append(
+                    {
+                        "id": pid,
+                        "name": player["name"],
+                        "position": player["position"],
+                        "ep": gw_ep,
+                        "cost": player["cost"],
+                        "team": team,
+                    }
+                )
 
         # Split by position and sort by EP
-        gkps = sorted([p for p in all_players if p['position'] == 1], key=lambda x: x['ep'], reverse=True)
-        defs = sorted([p for p in all_players if p['position'] == 2], key=lambda x: x['ep'], reverse=True)
-        mids = sorted([p for p in all_players if p['position'] == 3], key=lambda x: x['ep'], reverse=True)
-        fwds = sorted([p for p in all_players if p['position'] == 4], key=lambda x: x['ep'], reverse=True)
+        gkps = sorted(
+            [p for p in all_players if p["position"] == 1], key=lambda x: x["ep"], reverse=True
+        )
+        defs = sorted(
+            [p for p in all_players if p["position"] == 2], key=lambda x: x["ep"], reverse=True
+        )
+        mids = sorted(
+            [p for p in all_players if p["position"] == 3], key=lambda x: x["ep"], reverse=True
+        )
+        fwds = sorted(
+            [p for p in all_players if p["position"] == 4], key=lambda x: x["ep"], reverse=True
+        )
 
         # Try all valid formations and pick the best 15-man squad
         formations = [
@@ -1100,28 +1281,28 @@ class FPL2025ChipStrategy:
             # Start with best GKP
             if gkps:
                 selected_xi.append(gkps[0])
-                team_counts[gkps[0]['team']] = 1
+                team_counts[gkps[0]["team"]] = 1
 
             # Add defenders
             for p in defs:
-                if len([s for s in selected_xi if s['position'] == 2]) < n_def:
-                    if team_counts.get(p['team'], 0) < 3:
+                if len([s for s in selected_xi if s["position"] == 2]) < n_def:
+                    if team_counts.get(p["team"], 0) < 3:
                         selected_xi.append(p)
-                        team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
+                        team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
 
             # Add midfielders
             for p in mids:
-                if len([s for s in selected_xi if s['position'] == 3]) < n_mid:
-                    if team_counts.get(p['team'], 0) < 3:
+                if len([s for s in selected_xi if s["position"] == 3]) < n_mid:
+                    if team_counts.get(p["team"], 0) < 3:
                         selected_xi.append(p)
-                        team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
+                        team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
 
             # Add forwards
             for p in fwds:
-                if len([s for s in selected_xi if s['position'] == 4]) < n_fwd:
-                    if team_counts.get(p['team'], 0) < 3:
+                if len([s for s in selected_xi if s["position"] == 4]) < n_fwd:
+                    if team_counts.get(p["team"], 0) < 3:
                         selected_xi.append(p)
-                        team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
+                        team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
 
             # Check if we got a full valid XI
             if len(selected_xi) != 11:
@@ -1130,20 +1311,20 @@ class FPL2025ChipStrategy:
             # Now build bench (4 players): 1 GKP + 3 outfield
             # Squad must have: 2 GKP, 5 DEF, 5 MID, 3 FWD
             bench = []
-            selected_ids = {p['id'] for p in selected_xi}
+            selected_ids = {p["id"] for p in selected_xi}
 
             # Add backup GKP
             for p in gkps:
-                if p['id'] not in selected_ids and team_counts.get(p['team'], 0) < 3:
+                if p["id"] not in selected_ids and team_counts.get(p["team"], 0) < 3:
                     bench.append(p)
-                    team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
-                    selected_ids.add(p['id'])
+                    team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
+                    selected_ids.add(p["id"])
                     break
 
             # Calculate how many more of each position we need for full squad
-            xi_def_count = len([s for s in selected_xi if s['position'] == 2])
-            xi_mid_count = len([s for s in selected_xi if s['position'] == 3])
-            xi_fwd_count = len([s for s in selected_xi if s['position'] == 4])
+            xi_def_count = len([s for s in selected_xi if s["position"] == 2])
+            xi_mid_count = len([s for s in selected_xi if s["position"] == 3])
+            xi_fwd_count = len([s for s in selected_xi if s["position"] == 4])
 
             need_def = 5 - xi_def_count
             need_mid = 5 - xi_mid_count
@@ -1151,29 +1332,47 @@ class FPL2025ChipStrategy:
 
             # Add remaining 3 outfield bench players
             # Sort by cost (cheapest first) to stay within budget
-            cheap_defs = sorted([p for p in defs if p['id'] not in selected_ids], key=lambda x: x['cost'])
-            cheap_mids = sorted([p for p in mids if p['id'] not in selected_ids], key=lambda x: x['cost'])
-            cheap_fwds = sorted([p for p in fwds if p['id'] not in selected_ids], key=lambda x: x['cost'])
+            cheap_defs = sorted(
+                [p for p in defs if p["id"] not in selected_ids], key=lambda x: x["cost"]
+            )
+            cheap_mids = sorted(
+                [p for p in mids if p["id"] not in selected_ids], key=lambda x: x["cost"]
+            )
+            cheap_fwds = sorted(
+                [p for p in fwds if p["id"] not in selected_ids], key=lambda x: x["cost"]
+            )
 
             for p in cheap_defs:
-                if need_def > 0 and p['id'] not in selected_ids and team_counts.get(p['team'], 0) < 3:
+                if (
+                    need_def > 0
+                    and p["id"] not in selected_ids
+                    and team_counts.get(p["team"], 0) < 3
+                ):
                     bench.append(p)
-                    team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
-                    selected_ids.add(p['id'])
+                    team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
+                    selected_ids.add(p["id"])
                     need_def -= 1
 
             for p in cheap_mids:
-                if need_mid > 0 and p['id'] not in selected_ids and team_counts.get(p['team'], 0) < 3:
+                if (
+                    need_mid > 0
+                    and p["id"] not in selected_ids
+                    and team_counts.get(p["team"], 0) < 3
+                ):
                     bench.append(p)
-                    team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
-                    selected_ids.add(p['id'])
+                    team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
+                    selected_ids.add(p["id"])
                     need_mid -= 1
 
             for p in cheap_fwds:
-                if need_fwd > 0 and p['id'] not in selected_ids and team_counts.get(p['team'], 0) < 3:
+                if (
+                    need_fwd > 0
+                    and p["id"] not in selected_ids
+                    and team_counts.get(p["team"], 0) < 3
+                ):
                     bench.append(p)
-                    team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
-                    selected_ids.add(p['id'])
+                    team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
+                    selected_ids.add(p["id"])
                     need_fwd -= 1
 
             # Check if we got a full valid squad (15 players)
@@ -1181,12 +1380,12 @@ class FPL2025ChipStrategy:
                 continue
 
             # Check budget constraint
-            total_cost = sum(p['cost'] for p in selected_xi) + sum(p['cost'] for p in bench)
+            total_cost = sum(p["cost"] for p in selected_xi) + sum(p["cost"] for p in bench)
             if total_cost > budget + 0.1:  # Small tolerance for rounding
                 continue
 
             # Calculate starting XI EP
-            formation_ep = sum(p['ep'] for p in selected_xi)
+            formation_ep = sum(p["ep"] for p in selected_xi)
 
             # Pick the formation with highest starting XI EP
             if formation_ep > best_ep:
@@ -1204,25 +1403,23 @@ class FPL2025ChipStrategy:
         remaining_budget = budget - best_total_cost
 
         if remaining_budget > 0.5:  # If we have significant budget left
-            best_starting_xi, best_bench, best_total_cost, best_ep = self._upgrade_squad_with_budget(
-                best_starting_xi,
-                best_bench,
-                gkps, defs, mids, fwds,
-                remaining_budget,
-                budget
+            best_starting_xi, best_bench, best_total_cost, best_ep = (
+                self._upgrade_squad_with_budget(
+                    best_starting_xi, best_bench, gkps, defs, mids, fwds, remaining_budget, budget
+                )
             )
 
         remaining_budget = budget - best_total_cost
 
         return {
-            'formation': best_formation,
-            'starting_xi': best_starting_xi,
-            'bench': best_bench,
-            'players': best_starting_xi,  # For backward compatibility
-            'total_ep': best_ep,
-            'total_cost': best_total_cost,
-            'budget': budget,
-            'remaining_budget': remaining_budget
+            "formation": best_formation,
+            "starting_xi": best_starting_xi,
+            "bench": best_bench,
+            "players": best_starting_xi,  # For backward compatibility
+            "total_ep": best_ep,
+            "total_cost": best_total_cost,
+            "budget": budget,
+            "remaining_budget": remaining_budget,
         }
 
     def _calculate_haul_factor(self, player: pd.Series) -> float:
@@ -1235,17 +1432,17 @@ class FPL2025ChipStrategy:
         Returns: multiplier between 0.5 (low ceiling) and 2.0 (explosive upside)
         """
         # Position-based ceiling (FWD > MID > DEF > GKP)
-        position = player.get('position', 0)
+        position = player.get("position", 0)
         position_weights = {
-            4: 1.8,   # FWD - highest ceiling (hat-tricks, multiple returns)
-            3: 1.5,   # MID - high ceiling (goals worth more points)
-            2: 0.9,   # DEF - low ceiling (mainly clean sheets + occasional goal)
-            1: 0.6    # GKP - lowest ceiling (clean sheets + saves)
+            4: 1.8,  # FWD - highest ceiling (hat-tricks, multiple returns)
+            3: 1.5,  # MID - high ceiling (goals worth more points)
+            2: 0.9,  # DEF - low ceiling (mainly clean sheets + occasional goal)
+            1: 0.6,  # GKP - lowest ceiling (clean sheets + saves)
         }
         base_multiplier = position_weights.get(position, 1.0)
 
         # Goal threat bonus (xGI90_est indicates attacking output per 90)
-        xgi90 = player.get('xgi90_est', 0)
+        xgi90 = player.get("xgi90_est", 0)
         if xgi90 > 0:
             # xGI90 of 0.8+ = elite attacker, scale up to 1.3x
             # xGI90 of 0.4 = average attacker, scale up to 1.15x
@@ -1265,7 +1462,7 @@ class FPL2025ChipStrategy:
         player_data: pd.DataFrame,
         gw_start: int,
         gw_end: int,
-        top_n: int = 3
+        top_n: int = 3,
     ) -> List[Dict]:
         """
         Find best Triple Captain options across all gameweeks.
@@ -1285,8 +1482,8 @@ class FPL2025ChipStrategy:
             if pid not in per_gw_ep:
                 continue
 
-            player = player_data[player_data['player_id'] == pid].iloc[0]
-            player_name = player.get('name', 'Unknown')
+            player = player_data[player_data["player_id"] == pid].iloc[0]
+            player_name = player.get("name", "Unknown")
             haul_factor = self._calculate_haul_factor(player)
 
             for gw, ep in per_gw_ep[pid].items():
@@ -1294,17 +1491,19 @@ class FPL2025ChipStrategy:
                     # TC score = base EP * haul factor (prioritizes high ceiling)
                     tc_score = ep * haul_factor
 
-                    options.append({
-                        'gw': gw,
-                        'player_id': pid,
-                        'player_name': player_name,
-                        'ep': ep,
-                        'haul_factor': haul_factor,
-                        'tc_score': tc_score
-                    })
+                    options.append(
+                        {
+                            "gw": gw,
+                            "player_id": pid,
+                            "player_name": player_name,
+                            "ep": ep,
+                            "haul_factor": haul_factor,
+                            "tc_score": tc_score,
+                        }
+                    )
 
         # Sort by TC score (haul-adjusted) descending
-        options.sort(key=lambda x: x['tc_score'], reverse=True)
+        options.sort(key=lambda x: x["tc_score"], reverse=True)
         return options[:top_n]
 
     def _find_best_bb_options(
@@ -1313,7 +1512,7 @@ class FPL2025ChipStrategy:
         player_data: pd.DataFrame,
         gw_start: int,
         gw_end: int,
-        top_n: int = 3
+        top_n: int = 3,
     ) -> List[Dict]:
         """
         Find best Bench Boost options across all gameweeks.
@@ -1326,7 +1525,7 @@ class FPL2025ChipStrategy:
             return []
 
         # Get xmins for filtering likely starters
-        owned_data = player_data[player_data['player_id'].isin(owned_ids)]
+        owned_data = player_data[player_data["player_id"].isin(owned_ids)]
 
         # For each gameweek, identify bench (lowest 4 by EP)
         bb_options = []
@@ -1334,26 +1533,28 @@ class FPL2025ChipStrategy:
             gw_eps = []
             for pid in owned_ids:
                 gw_ep = per_gw_ep.get(pid, {}).get(gw, 0)
-                xmins = owned_data[owned_data['player_id'] == pid]['xmins'].iloc[0] if len(owned_data[owned_data['player_id'] == pid]) > 0 else 0
-                gw_eps.append({'player_id': pid, 'ep': gw_ep, 'xmins': xmins})
+                xmins = (
+                    owned_data[owned_data["player_id"] == pid]["xmins"].iloc[0]
+                    if len(owned_data[owned_data["player_id"] == pid]) > 0
+                    else 0
+                )
+                gw_eps.append({"player_id": pid, "ep": gw_ep, "xmins": xmins})
 
             # Sort by EP descending - top 11 are starters, bottom 4 are bench
-            gw_eps.sort(key=lambda x: x['ep'], reverse=True)
+            gw_eps.sort(key=lambda x: x["ep"], reverse=True)
             bench = gw_eps[-4:]
 
             # Only count bench players likely to play (xmins >= 60)
-            playing_bench = [p for p in bench if p['xmins'] >= self.config.bb_min_xmins]
-            bench_ep = sum(p['ep'] for p in playing_bench)
+            playing_bench = [p for p in bench if p["xmins"] >= self.config.bb_min_xmins]
+            bench_ep = sum(p["ep"] for p in playing_bench)
 
             if bench_ep > 0:
-                bb_options.append({
-                    'gw': gw,
-                    'bench_ep': bench_ep,
-                    'num_playing': len(playing_bench)
-                })
+                bb_options.append(
+                    {"gw": gw, "bench_ep": bench_ep, "num_playing": len(playing_bench)}
+                )
 
         # Sort by bench EP descending
-        bb_options.sort(key=lambda x: x['bench_ep'], reverse=True)
+        bb_options.sort(key=lambda x: x["bench_ep"], reverse=True)
         return bb_options[:top_n]
 
     def _find_best_fh_options(
@@ -1362,7 +1563,7 @@ class FPL2025ChipStrategy:
         player_data: pd.DataFrame,
         gw_start: int,
         gw_end: int,
-        top_n: int = 3
+        top_n: int = 3,
     ) -> List[Dict]:
         """
         Find best Free Hit options by comparing owned XI vs optimal XI.
@@ -1384,141 +1585,29 @@ class FPL2025ChipStrategy:
             # Calculate optimal XI EP for this GW using shared team builder
             # This ensures consistent EP calculations and enforces max 3 per club
             optimal_result = self._build_optimal_xi_for_gw(gw, player_data, per_gw_ep)
-            optimal_xi_ep = optimal_result.get('total_ep', 0) if optimal_result else 0
+            optimal_xi_ep = optimal_result.get("total_ep", 0) if optimal_result else 0
 
             gap = optimal_xi_ep - owned_xi_ep
             if gap > 0:
-                fh_options.append({
-                    'gw': gw,
-                    'owned_xi_ep': owned_xi_ep,
-                    'optimal_xi_ep': optimal_xi_ep,
-                    'gap': gap
-                })
+                fh_options.append(
+                    {
+                        "gw": gw,
+                        "owned_xi_ep": owned_xi_ep,
+                        "optimal_xi_ep": optimal_xi_ep,
+                        "gap": gap,
+                    }
+                )
 
         # Sort by gap descending
-        fh_options.sort(key=lambda x: x['gap'], reverse=True)
+        fh_options.sort(key=lambda x: x["gap"], reverse=True)
         return fh_options[:top_n]
 
-    def _get_best_captain(
-        self,
-        gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame
-    ) -> Optional[Dict]:
-        """Get best captain for a gameweek from owned players only"""
-
-        # ALWAYS filter by owned players when use_myteam is enabled
-        if player_data.empty or not owned_ids:
-            return None
-
-        owned = player_data[player_data['player_id'].isin(owned_ids)]
-
-        # Captain from MID/FWD (prefer attackers)
-        captains = owned[owned['position'].isin([3, 4])]  # MID=3, FWD=4
-
-        # Fallback to DEF if no MID/FWD available
-        if captains.empty:
-            captains = owned[owned['position'] == 2]  # DEF=2
-
-        if captains.empty:
-            return None
-
-        best = captains.nlargest(1, 'ep_blend').iloc[0]
-
-        return {
-            'name': best.get('name', 'Unknown'),
-            'ep': best.get('ep_blend', 0),
-            'id': best.get('player_id')
-        }
-    
-    def _calculate_bench_ep(
-        self,
-        gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame
-    ) -> float:
-        """Calculate expected bench points from owned players only"""
-
-        # ALWAYS calculate from owned players when use_myteam is enabled
-        if not owned_ids or player_data.empty:
-            return 0
-
-        owned = player_data[player_data['player_id'].isin(owned_ids)]
-
-        # Assume bottom 4 players by EP are bench
-        if len(owned) < 15:
-            return 0
-
-        bench = owned.nsmallest(4, 'ep_blend')
-
-        # Only count bench players likely to play (xmins >= threshold)
-        playing = bench[bench['xmins'] >= self.config.bb_min_xmins]
-
-        # Return sum of playing bench players (even if less than 4)
-        # BB is still valuable if you have 2-3 good bench options
-        return playing['ep_blend'].sum()
-    
-    def _calculate_fh_gap(
-        self,
-        gw: int,
-        owned_ids: Set[int],
-        player_data: pd.DataFrame
-    ) -> float:
-        """Calculate FH value based on gap between ideal XI and owned XI"""
-
-        # ALWAYS calculate from owned players when use_myteam is enabled
-        if not owned_ids or player_data.empty:
-            return 0
-        
-        # Build ideal XI with formation constraints
-        # 1 GK, 3-5 DEF, 2-5 MID, 1-3 FWD
-        gks = player_data[player_data['position'] == 1].nlargest(1, 'ep_blend')
-        defs = player_data[player_data['position'] == 2].nlargest(5, 'ep_blend')
-        mids = player_data[player_data['position'] == 3].nlargest(5, 'ep_blend')  
-        fwds = player_data[player_data['position'] == 4].nlargest(3, 'ep_blend')
-        
-        # Try different formations and pick best
-        formations = [
-            (3, 5, 2),  # 352
-            (3, 4, 3),  # 343
-            (4, 4, 2),  # 442
-            (4, 3, 3),  # 433
-            (4, 5, 1),  # 451
-            (5, 3, 2),  # 532
-            (5, 4, 1),  # 541
-        ]
-        
-        best_ideal_ep = 0
-        for n_def, n_mid, n_fwd in formations:
-            formation_team = pd.concat([
-                gks.head(1),
-                defs.head(n_def),
-                mids.head(n_mid),
-                fwds.head(n_fwd)
-            ])
-            if len(formation_team) == 11:
-                ep = formation_team['ep_blend'].sum()
-                best_ideal_ep = max(best_ideal_ep, ep)
-        
-        # Owned XI - best 11 from owned players
-        owned = player_data[player_data['player_id'].isin(owned_ids)]
-        if len(owned) < 11:
-            return best_ideal_ep
-        
-        # Must have at least 1 GK in owned XI
-        owned_gks = owned[owned['position'] == 1].nlargest(1, 'ep_blend')
-        owned_others = owned[owned['player_id'].isin(owned_gks['player_id']) == False].nlargest(10, 'ep_blend')
-        owned_xi = pd.concat([owned_gks, owned_others])
-        owned_xi_ep = owned_xi['ep_blend'].sum()
-        
-        return max(0, best_ideal_ep - owned_xi_ep)
-    
     def _find_best_captain_dgw(
         self,
         dgws: List[int],
         owned_ids: Set[int],
         player_data: pd.DataFrame,
-        excluded_gws: Optional[Set[int]] = None
+        excluded_gws: Optional[Set[int]] = None,
     ) -> Optional[Dict]:
         """Find best captain for DGWs from owned players"""
         if not owned_ids or player_data.empty or not dgws:
@@ -1528,77 +1617,62 @@ class FPL2025ChipStrategy:
         if not available_dgws:
             return None
 
-        owned = player_data[player_data['player_id'].isin(owned_ids)]
+        owned = player_data[player_data["player_id"].isin(owned_ids)]
 
         # Captain from MID/FWD (prefer attackers for DGW)
-        captains = owned[owned['position'].isin([3, 4])]
+        captains = owned[owned["position"].isin([3, 4])]
 
         # Fallback to DEF if no MID/FWD
         if captains.empty:
-            captains = owned[owned['position'] == 2]
+            captains = owned[owned["position"] == 2]
 
         if captains.empty:
             return None
 
-        best = captains.nlargest(1, 'ep_blend').iloc[0]
+        best = captains.nlargest(1, "ep_adjusted").iloc[0]
 
         # Estimate DGW points as 2x single gameweek (conservative)
-        dgw_ep = best.get('ep_blend', 0) * 2.0
+        dgw_ep = best.get("ep_adjusted", 0) * 2.0
 
-        return {
-            'gw': available_dgws[0],
-            'player': best.get('name', 'Unknown'),
-            'ep': dgw_ep
-        }
-    
+        return {"gw": available_dgws[0], "player": best.get("name", "Unknown"), "ep": dgw_ep}
+
     def _find_best_bench_boost_dgw(
         self,
         dgws: List[int],
         owned_ids: Set[int],
         player_data: pd.DataFrame,
-        excluded_gws: Optional[Set[int]] = None
+        excluded_gws: Optional[Set[int]] = None,
     ) -> Optional[Dict]:
         """Find best BB opportunity in DGWs (or best SGW as fallback) from owned players"""
         if not owned_ids or player_data.empty:
             return None
 
-        owned = player_data[player_data['player_id'].isin(owned_ids)]
+        owned = player_data[player_data["player_id"].isin(owned_ids)]
 
         # Assume bottom 4 players by EP are bench
         if len(owned) < 15:
             return None
 
-        bench = owned.nsmallest(4, 'ep_blend')
+        bench = owned.nsmallest(4, "ep_adjusted")
 
         available_dgws = [gw for gw in dgws if gw not in (excluded_gws or set())]
 
         if available_dgws:
             # Estimate DGW bench points as 2x single gameweek
-            bench_ep = bench['ep_blend'].sum() * 2.0
-            return {
-                'gw': available_dgws[-1],
-                'bench_ep': bench_ep,
-                'dgw_players': 4
-            }
+            bench_ep = bench["ep_adjusted"].sum() * 2.0
+            return {"gw": available_dgws[-1], "bench_ep": bench_ep, "dgw_players": 4}
 
         # SGW fallback: pick best remaining SGW (GW34-37 range)
-        bench_ep = bench['ep_blend'].sum()
+        bench_ep = bench["ep_adjusted"].sum()
         excluded = excluded_gws or set()
         for gw in range(37, 27, -1):
             if gw not in excluded:
-                return {
-                    'gw': gw,
-                    'bench_ep': bench_ep,
-                    'dgw_players': 0
-                }
+                return {"gw": gw, "bench_ep": bench_ep, "dgw_players": 0}
 
         return None
-    
+
     def _find_h2_wildcard_gw(
-        self,
-        dgws: List[int],
-        fh_gw: Optional[int] = None,
-        excluded_gws: Optional[Set[int]] = None
+        self, dgws: List[int], fh_gw: Optional[int] = None, excluded_gws: Optional[Set[int]] = None
     ) -> Optional[int]:
         """Find optimal H2 wildcard timing.
 
@@ -1624,40 +1698,55 @@ class FPL2025ChipStrategy:
         if 30 not in excluded:
             return 30
         return None
-    
-    def _explain_strategy(self, recommendations: Dict, current_gw: int, show_teams: bool = False, used_chips: Set[str] = None):
+
+    def _explain_strategy(
+        self,
+        recommendations: Dict,
+        current_gw: int,
+        show_teams: bool = False,
+        used_chips: Set[str] = None,
+        owned_ids: Set[int] = None,
+    ):
         """Explain the strategy to user"""
 
         if used_chips is None:
             used_chips = set()
 
+        from ..config import current_season, season_label
+
         print("\n" + "=" * 70)
-        print("FPL 2025/26 CHIP STRATEGY - DOUBLE CHIPS SYSTEM")
+        print(f"FPL {season_label(current_season())} CHIP STRATEGY - DOUBLE CHIPS SYSTEM")
         print("=" * 70)
 
         print(f"\n📅 Current: GW{current_gw}")
-        print(f"⏰ H1 Deadline: GW19 (30 Dec)")
-        print(f"🔄 H2 Starts: GW20")
+        print(f"⏰ H1 Deadline: GW{self.h1_deadline} ({self._deadline_date(self.h1_deadline)})")
+        print(f"🔄 H2 Starts: GW{self.h2_start}")
+        if not owned_ids:
+            print(
+                "\n⚠️  No squad loaded, so Triple Captain and Bench Boost cannot be assessed"
+                "\n   and the Free Hit gain below is the optimal XI, not a gain over your own."
+                "\n   Run `fpl myteam sync --entry YOUR_ID` for a personalised plan."
+            )
 
         # Show used chips if any
         if used_chips:
-            h1_used = [c for c in used_chips if c.startswith('H1_')]
-            h2_used = [c for c in used_chips if c.startswith('H2_')]
+            h1_used = [c for c in used_chips if c.startswith("H1_")]
+            h2_used = [c for c in used_chips if c.startswith("H2_")]
 
             if h1_used:
-                chip_names = [c.replace('H1_', '') for c in h1_used]
+                chip_names = [c.replace("H1_", "") for c in h1_used]
                 print(f"\n✅ H1 Chips Already Used: {', '.join(chip_names)}")
             if h2_used:
-                chip_names = [c.replace('H2_', '') for c in h2_used]
+                chip_names = [c.replace("H2_", "") for c in h2_used]
                 print(f"✅ H2 Chips Already Used: {', '.join(chip_names)}")
 
         # Separate by half
-        h1_chips = {k: v for k, v in recommendations.items() if 'H1_' in k}
-        h2_chips = {k: v for k, v in recommendations.items() if 'H2_' in k}
+        h1_chips = {k: v for k, v in recommendations.items() if "H1_" in k}
+        h2_chips = {k: v for k, v in recommendations.items() if "H2_" in k}
 
-        if current_gw <= 19:
-            remaining = 19 - current_gw + 1
-            h1_used_count = len([c for c in used_chips if c.startswith('H1_')])
+        if current_gw <= self.h1_deadline:
+            remaining = self.h1_deadline - current_gw + 1
+            h1_used_count = len([c for c in used_chips if c.startswith("H1_")])
             remaining_chips = 4 - h1_used_count
             print(f"\n⚠️  {remaining} gameweeks left to use {remaining_chips} H1 chips!")
 
@@ -1665,13 +1754,13 @@ class FPL2025ChipStrategy:
                 print("🚨 URGENT: Use your H1 chips NOW or lose them!")
 
         print("\n" + "-" * 35 + " FIRST HALF " + "-" * 35)
-        print("Must use before GW19 deadline - Use it or lose it!\n")
+        print(f"Must use before GW{self.h1_deadline} deadline - Use it or lose it!\n")
 
         for chip_key, rec in h1_chips.items():
             self._print_chip_recommendation(rec)
 
-        if not h1_chips and current_gw <= 19:
-            h1_used_count = len([c for c in used_chips if c.startswith('H1_')])
+        if not h1_chips and current_gw <= self.h1_deadline:
+            h1_used_count = len([c for c in used_chips if c.startswith("H1_")])
             if h1_used_count == 4:
                 print("✅ All H1 chips have been used!")
             else:
@@ -1680,7 +1769,7 @@ class FPL2025ChipStrategy:
 
         # Show H1 Free Hit team if requested (skip HOLD chips)
         if show_teams:
-            h1_fh = h1_chips.get('H1_FH')
+            h1_fh = h1_chips.get("H1_FH")
             if h1_fh and h1_fh.gameweek > 0:
                 print("\n" + "-" * 60)
                 print("📋 H1 FREE HIT TEAM PREVIEW")
@@ -1696,7 +1785,7 @@ class FPL2025ChipStrategy:
 
         # Show H2 Free Hit team if requested (skip HOLD chips)
         if show_teams:
-            h2_fh = h2_chips.get('H2_FH')
+            h2_fh = h2_chips.get("H2_FH")
             if h2_fh and h2_fh.gameweek > 0:
                 print("\n" + "-" * 60)
                 print("📋 H2 FREE HIT TEAM PREVIEW")
@@ -1705,12 +1794,11 @@ class FPL2025ChipStrategy:
                 print(fh_team)
 
         # Summary of held chips
-        held_chips = [
-            rec for rec in recommendations.values()
-            if rec.gameweek == 0
-        ]
+        held_chips = [rec for rec in recommendations.values() if rec.gameweek == 0]
         if held_chips:
-            held_names = [rec.chip_type.value.replace('H1_', '').replace('H2_', '') for rec in held_chips]
+            held_names = [
+                rec.chip_type.value.replace("H1_", "").replace("H2_", "") for rec in held_chips
+            ]
             print(f"\n⏳ Chips on HOLD ({len(held_chips)}): {', '.join(held_names)}")
             print("   These will be assigned once fixtures are confirmed.")
 
@@ -1746,18 +1834,19 @@ class FPL2025ChipStrategy:
         # Add hint about show-teams if not used (only for non-HOLD FH chips)
         if not show_teams:
             fh_recommendations = [
-                rec for key, rec in recommendations.items()
-                if 'FH' in key and rec.gameweek > 0
+                rec for key, rec in recommendations.items() if "FH" in key and rec.gameweek > 0
             ]
             if fh_recommendations:
-                print("\n💡 TIP: Use --show-teams to see the full Free Hit XI for recommended gameweeks")
+                print(
+                    "\n💡 TIP: Use --show-teams to see the full Free Hit XI for recommended gameweeks"
+                )
                 print("   Or run: fpl chips free-hit --gw X")
-        
+
     def _print_chip_recommendation(self, rec: ChipRecommendation):
         """Print a single chip recommendation"""
 
-        chip_name = rec.chip_type.value.replace('H1_', '').replace('H2_', '')
-        emoji = {'TC': '👑', 'BB': '💪', 'FH': '🎯', 'WC': '🔄'}.get(chip_name, '📌')
+        chip_name = rec.chip_type.value.replace("H1_", "").replace("H2_", "")
+        emoji = {"TC": "👑", "BB": "💪", "FH": "🎯", "WC": "🔄"}.get(chip_name, "📌")
 
         if rec.gameweek == 0:
             # HOLD chip — no gameweek assigned yet
@@ -1785,13 +1874,6 @@ class FPL2025ChipStrategy:
 
 # ----------------------------- Entry Point -----------------------------
 
-def plan_chips_2025(use_myteam: bool = True, explain: bool = True, show_teams: bool = False):
-    """
-    Generate chip strategy for FPL 2025/26 with double chips
-    """
-    strategy = FPL2025ChipStrategy()
-    return strategy.plan_chips(use_myteam=use_myteam, explain=explain, show_teams=show_teams)
-
 
 def generate_free_hit_team(gw: int) -> str:
     """
@@ -1803,7 +1885,7 @@ def generate_free_hit_team(gw: int) -> str:
     Returns:
         Formatted string with team details
     """
-    strategy = FPL2025ChipStrategy()
+    strategy = ChipStrategy()
 
     # Load player data
     player_data = strategy._load_player_data()
@@ -1817,12 +1899,12 @@ def generate_free_hit_team(gw: int) -> str:
     # Build optimal 15-man squad with actual budget
     result = strategy._build_optimal_xi_for_gw(gw, player_data, per_gw_ep, budget=budget)
 
-    if not result or not result.get('starting_xi'):
+    if not result or not result.get("starting_xi"):
         return f"Could not generate Free Hit team for GW{gw}. No valid formation found."
 
     # Get starting XI and bench
-    starting_xi = result['starting_xi']
-    bench = result.get('bench', [])
+    starting_xi = result["starting_xi"]
+    bench = result.get("bench", [])
     captain, vice = _select_captain_for_fh(starting_xi)
 
     # Format output
@@ -1832,12 +1914,12 @@ def generate_free_hit_team(gw: int) -> str:
     output.append("=" * 70)
     output.append("")
 
-    formation = result['formation']
+    formation = result["formation"]
     output.append(f"Formation: {formation[0]}-{formation[1]}-{formation[2]}")
     output.append(f"Starting XI Expected Points: {result['total_ep']:.1f}")
 
     # Calculate bench EP
-    bench_ep = sum(p['ep'] for p in bench)
+    bench_ep = sum(p["ep"] for p in bench)
     output.append(f"Bench Expected Points: {bench_ep:.1f}")
 
     # Budget information
@@ -1855,20 +1937,22 @@ def generate_free_hit_team(gw: int) -> str:
     # Group starting XI by position
     by_position = {1: [], 2: [], 3: [], 4: []}
     for p in starting_xi:
-        by_position[p['position']].append(p)
+        by_position[p["position"]].append(p)
 
-    position_names = {1: 'GOALKEEPER', 2: 'DEFENDERS', 3: 'MIDFIELDERS', 4: 'FORWARDS'}
+    position_names = {1: "GOALKEEPER", 2: "DEFENDERS", 3: "MIDFIELDERS", 4: "FORWARDS"}
 
     for pos_id in [1, 2, 3, 4]:
         if by_position[pos_id]:
             output.append(f"{position_names[pos_id]}:")
             for p in by_position[pos_id]:
                 cap_marker = ""
-                if captain and p['id'] == captain['id']:
+                if captain and p["id"] == captain["id"]:
                     cap_marker = " (C)"
-                elif vice and p['id'] == vice['id']:
+                elif vice and p["id"] == vice["id"]:
                     cap_marker = " (VC)"
-                output.append(f"  {p['name']} ({p['team']}) - {p['ep']:.2f} EP, £{p['cost']:.1f}m{cap_marker}")
+                output.append(
+                    f"  {p['name']} ({p['team']}) - {p['ep']:.2f} EP, £{p['cost']:.1f}m{cap_marker}"
+                )
             output.append("")
 
     # Display bench
@@ -1878,9 +1962,9 @@ def generate_free_hit_team(gw: int) -> str:
 
     bench_by_position = {1: [], 2: [], 3: [], 4: []}
     for p in bench:
-        bench_by_position[p['position']].append(p)
+        bench_by_position[p["position"]].append(p)
 
-    bench_position_names = {1: 'GOALKEEPER', 2: 'DEFENDERS', 3: 'MIDFIELDERS', 4: 'FORWARDS'}
+    bench_position_names = {1: "GOALKEEPER", 2: "DEFENDERS", 3: "MIDFIELDERS", 4: "FORWARDS"}
 
     for pos_id in [1, 2, 3, 4]:
         if bench_by_position[pos_id]:
@@ -1897,7 +1981,7 @@ def generate_free_hit_team(gw: int) -> str:
     all_players = starting_xi + bench
     team_counts = {}
     for p in all_players:
-        team_counts[p['team']] = team_counts.get(p['team'], 0) + 1
+        team_counts[p["team"]] = team_counts.get(p["team"], 0) + 1
 
     output.append("Team Distribution:")
     for team, count in sorted(team_counts.items(), key=lambda x: x[1], reverse=True):
@@ -1907,7 +1991,7 @@ def generate_free_hit_team(gw: int) -> str:
     # Squad composition
     pos_counts = {1: 0, 2: 0, 3: 0, 4: 0}
     for p in all_players:
-        pos_counts[p['position']] += 1
+        pos_counts[p["position"]] += 1
 
     output.append("Squad Composition:")
     output.append(f"  Goalkeepers: {pos_counts[1]}")
@@ -1918,9 +2002,13 @@ def generate_free_hit_team(gw: int) -> str:
 
     # Captaincy recommendations
     if captain:
-        output.append(f"RECOMMENDED CAPTAIN: {captain['name']} (Haul-adjusted: {captain['haul_score']:.2f})")
+        output.append(
+            f"RECOMMENDED CAPTAIN: {captain['name']} (Haul-adjusted: {captain['haul_score']:.2f})"
+        )
     if vice:
-        output.append(f"RECOMMENDED VICE-CAPTAIN: {vice['name']} (Haul-adjusted: {vice['haul_score']:.2f})")
+        output.append(
+            f"RECOMMENDED VICE-CAPTAIN: {vice['name']} (Haul-adjusted: {vice['haul_score']:.2f})"
+        )
 
     output.append("=" * 70)
 
@@ -1942,17 +2030,17 @@ def _select_captain_for_fh(players: List[Dict]) -> Tuple[Optional[Dict], Optiona
 
     # Position-based haul factors
     position_weights = {
-        4: 1.8,   # FWD - highest ceiling
-        3: 1.5,   # MID - high ceiling
-        2: 0.9,   # DEF - low ceiling
-        1: 0.6    # GKP - lowest ceiling
+        4: 1.8,  # FWD - highest ceiling
+        3: 1.5,  # MID - high ceiling
+        2: 0.9,  # DEF - low ceiling
+        1: 0.6,  # GKP - lowest ceiling
     }
 
     # Calculate haul scores for all players
     scored_players = []
     for p in players:
         # Base haul factor from position
-        base_multiplier = position_weights.get(p['position'], 1.0)
+        base_multiplier = position_weights.get(p["position"], 1.0)
 
         # Boost from xGI90 if available (goal threat)
         # Note: xgi90 might not be in the player dict from _build_optimal_xi_for_gw
@@ -1960,14 +2048,14 @@ def _select_captain_for_fh(players: List[Dict]) -> Tuple[Optional[Dict], Optiona
         haul_factor = base_multiplier
 
         # Haul-adjusted score
-        haul_score = p['ep'] * haul_factor
+        haul_score = p["ep"] * haul_factor
 
         player_copy = p.copy()
-        player_copy['haul_score'] = haul_score
+        player_copy["haul_score"] = haul_score
         scored_players.append(player_copy)
 
     # Sort by haul score descending
-    scored_players.sort(key=lambda x: x['haul_score'], reverse=True)
+    scored_players.sort(key=lambda x: x["haul_score"], reverse=True)
 
     captain = scored_players[0] if len(scored_players) > 0 else None
     vice = scored_players[1] if len(scored_players) > 1 else None
@@ -1975,22 +2063,26 @@ def _select_captain_for_fh(players: List[Dict]) -> Tuple[Optional[Dict], Optiona
     return captain, vice
 
 
-def analyze_free_hit_all_gws(gw_start: Optional[int] = None, gw_end: int = 19) -> str:
+def analyze_free_hit_all_gws(gw_start: Optional[int] = None, gw_end: Optional[int] = None) -> str:
     """
     Analyze Free Hit value for all gameweeks in a range
 
     Args:
-        gw_start: Starting gameweek (defaults to current GW)
-        gw_end: Ending gameweek
+        gw_start: Starting gameweek (defaults to the first gameweek FH can be played)
+        gw_end: Ending gameweek (defaults to the H1 chip deadline from the API)
 
     Returns:
         Formatted string with EP comparison table
     """
-    strategy = FPL2025ChipStrategy()
+    strategy = ChipStrategy()
 
-    # Get current gameweek if not specified
+    current = strategy._get_current_gw()
     if gw_start is None:
-        gw_start = strategy._get_current_gw()
+        # The Free Hit is not always available in GW1, so start from the first gameweek it
+        # can actually be played rather than from the current one.
+        gw_start = strategy._chip_start("H1", "FH", current)
+    if gw_end is None:
+        gw_end = strategy.h1_deadline
 
     # Load team and player data
     owned_ids = strategy._load_myteam()
@@ -2008,7 +2100,9 @@ def analyze_free_hit_all_gws(gw_start: Optional[int] = None, gw_end: int = 19) -
     output.append(f"FREE HIT ANALYSIS: GW{gw_start} - GW{gw_end}")
     output.append("=" * 70)
     output.append("")
-    output.append(f"{'GW':<4} {'Your XI EP':<12} {'Optimal XI EP':<15} {'Delta':<10} {'Worth FH?':<10}")
+    output.append(
+        f"{'GW':<4} {'Your XI EP':<12} {'Optimal XI EP':<15} {'Delta':<10} {'Worth FH?':<10}"
+    )
     output.append("-" * 70)
 
     results = []
@@ -2020,27 +2114,31 @@ def analyze_free_hit_all_gws(gw_start: Optional[int] = None, gw_end: int = 19) -
 
         # Calculate optimal XI EP using the constraint-respecting builder
         optimal_result = strategy._build_optimal_xi_for_gw(gw, player_data, per_gw_ep)
-        optimal_xi_ep = optimal_result.get('total_ep', 0) if optimal_result else 0
+        optimal_xi_ep = optimal_result.get("total_ep", 0) if optimal_result else 0
 
         delta = optimal_xi_ep - owned_xi_ep
 
         # Determine if worth using FH (threshold of ~6+ points gain)
         worth_it = "✓ YES" if delta >= 6.0 else ("Maybe" if delta >= 4.0 else "No")
 
-        results.append({
-            'gw': gw,
-            'owned': owned_xi_ep,
-            'optimal': optimal_xi_ep,
-            'delta': delta,
-            'worth_it': worth_it
-        })
+        results.append(
+            {
+                "gw": gw,
+                "owned": owned_xi_ep,
+                "optimal": optimal_xi_ep,
+                "delta": delta,
+                "worth_it": worth_it,
+            }
+        )
 
-        output.append(f"{gw:<4} {owned_xi_ep:<12.1f} {optimal_xi_ep:<15.1f} {delta:<10.1f} {worth_it:<10}")
+        output.append(
+            f"{gw:<4} {owned_xi_ep:<12.1f} {optimal_xi_ep:<15.1f} {delta:<10.1f} {worth_it:<10}"
+        )
 
     output.append("-" * 70)
 
     # Find the best gameweek
-    best_gw = max(results, key=lambda x: x['delta'])
+    best_gw = max(results, key=lambda x: x["delta"])
     output.append("")
     output.append(f"BEST FREE HIT GAMEWEEK: GW{best_gw['gw']}")
     output.append(f"  Your XI:    {best_gw['owned']:.1f} EP")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpl-predict"
-version = "0.4.3"
+version = "2.0.0"
 description = "FPL player-points prediction & transfer advisor"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "python-dotenv>=1.0",          # ensure .env loading works
     "scikit-learn>=1.4",
+    "scipy>=1.11",                 # Poisson expectations for saves and goals conceded
     "xgboost>=2.0",                # gradient boosting
     "lightgbm>=4.0",               # gradient boosting alternative
     "optuna>=3.5",                 # hyperparameter optimization

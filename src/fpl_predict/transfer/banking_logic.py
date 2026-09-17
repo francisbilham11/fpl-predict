@@ -73,22 +73,31 @@ def evaluate_banking_decision(
     except Exception as e:
         log.debug(f"Could not check club violations: {e}")
 
-    # Check for unavailable/injured players
-    for player in current_squad:
-        # Handle both dict and int formats
-        if isinstance(player, dict):
-            player_id = player.get('element') or player.get('id')
-        else:
-            player_id = player
-        ep = ep_predictions.get(player_id, 0)
-        xmins = xmins_predictions.get(player_id, 90)
-        
-        if ep == 0 or xmins == 0:
-            metrics['unavailable_players'] += 1
-            metrics['dead_players'].append(player_id)
-            log.info(f"Found unavailable player {player_id} with EP={ep:.2f}, xMins={xmins:.0f}")
-        elif ep < 1.0:  # Very low EP threshold
-            metrics['low_ep_players'] += 1
+    # Check for unavailable/injured players. Only trust this when we actually have
+    # predictions to check against — an empty ep_predictions (e.g. exp_points.parquet
+    # failed to load) would otherwise make every player's .get(id, 0) default to 0 and
+    # look "unavailable", falsely triggering a "can't field 11 players" alarm.
+    if not ep_predictions:
+        log.warning("No EP predictions available; skipping unavailable-player detection")
+    else:
+        for player in current_squad:
+            # Handle both dict and int formats
+            if isinstance(player, dict):
+                player_id = player.get('element') or player.get('id')
+            else:
+                player_id = player
+            if player_id not in ep_predictions:
+                log.warning(f"No EP prediction for player {player_id}; skipping availability check for them")
+                continue
+            ep = ep_predictions[player_id]
+            xmins = xmins_predictions.get(player_id, 90)
+
+            if ep == 0 or xmins == 0:
+                metrics['unavailable_players'] += 1
+                metrics['dead_players'].append(player_id)
+                log.info(f"Found unavailable player {player_id} with EP={ep:.2f}, xMins={xmins:.0f}")
+            elif ep < 1.0:  # Very low EP threshold
+                metrics['low_ep_players'] += 1
     
     # Calculate urgency score
     metrics['urgency_score'] = (

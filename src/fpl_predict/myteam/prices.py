@@ -1,16 +1,14 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
-import requests
 import pandas as pd
+from ..data.fpl_api import get_bootstrap
 from ..utils.cache import DATA
 from ..utils.logging import get_logger
 log = get_logger(__name__)
-BASE = "https://fantasy.premierleague.com/api/bootstrap-static/"
 def _now() -> str: return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def snapshot_prices() -> Path:
-    r = requests.get(BASE, timeout=30); r.raise_for_status()
-    els = r.json().get("elements", [])
+    els = get_bootstrap().get("elements", [])
     df = pd.DataFrame([{"id": e["id"], "web_name": e["web_name"], "now_cost": e["now_cost"], "team": e["team"]} for e in els])
     df["snapshot"] = _now()
     outdir = DATA / "processed" / "prices"; outdir.mkdir(parents=True, exist_ok=True)

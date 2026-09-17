@@ -26,7 +26,15 @@ def detect_position_competition():
     
     # Convert ownership to float for calculations
     players['selected_by_percent'] = players['selected_by_percent'].astype(float)
-    
+
+    # How many games has anyone actually started so far this season? Used below as an
+    # empirical override: the price/ownership hierarchy this function otherwise relies on
+    # assumes a formation-agnostic "4-5 defenders start" average, which misclassifies a
+    # genuinely nailed 5th defender on a back-five team as a rotation risk purely for
+    # ranking below higher-owned teammates. A player who has started every available game
+    # so far is proven to be a starter regardless of what the ownership heuristic guesses.
+    games_so_far = int(players['starts'].max()) if 'starts' in players.columns and len(players) else 0
+
     # Expected regular starters per position (based on common formations)
     expected_starters = {
         1: 1,   # GKP: 1 starter
@@ -63,7 +71,13 @@ def detect_position_competition():
                 
                 # Calculate player's rank in pecking order
                 rank = position_players.index.get_loc(idx) + 1
-                
+
+                # Empirically nailed: started every game played so far, whatever their
+                # price/ownership rank among teammates suggests. Skips every discount path
+                # below (rank-based and the low-ownership special case alike).
+                if pos_id != 1 and games_so_far > 0 and int(player.get('starts', 0) or 0) >= games_so_far:
+                    continue
+
                 # Relative metrics (0-1 scale)
                 relative_cost = cost / max_cost if max_cost > 0 else 0
                 relative_ownership = ownership / max_ownership if max_ownership > 0 else 0

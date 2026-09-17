@@ -26,6 +26,10 @@ data/processed/*
 *.arrow
 *.feather
 
+# Solver debug dumps (e.g. PuLP's writeLP) — never intentional output, shouldn't be committed
+*.lp
+*.mps
+
 # Logs
 *.log
 
@@ -51,3 +55,4 @@ reports/
 
 # Cache
 .cache/
+.ruff_cache/

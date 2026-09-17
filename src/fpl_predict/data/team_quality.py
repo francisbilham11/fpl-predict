@@ -1,224 +1,197 @@
+"""Team quality scores from historical match results.
+
+Keyed on canonical team slugs and scoped to the seasons actually on disk, rather than to a
+hardcoded pair of season numbers and a hardcoded list of last summer's promoted clubs.
+Newly promoted clubs get the score implied by the bottom of the previous table instead of a
+fixed constant, so the ranking does not silently rot each August.
 """
-Calculate team quality from actual historical match performance data.
-"""
+
 from __future__ import annotations
 
+from typing import Dict
+
 import pandas as pd
-import numpy as np
-from typing import Dict, Tuple
-from ..utils.logging import get_logger
-from ..utils.cache import RAW, PROC
+
+from ..config import current_season
+from ..utils.cache import PROC, RAW
 from ..utils.io import read_parquet, write_parquet
+from ..utils.logging import get_logger
+from .teams import canonical_team
 
 log = get_logger(__name__)
 
+# Seasons of results used to judge quality. Two is enough to smooth out a single bad year
+# without carrying a squad that no longer exists.
+QUALITY_SEASONS = 2
 
-def calculate_team_quality_from_data() -> Dict[str, float]:
+# Quality is normalised into this band, with 1.0 as league average.
+MIN_SCORE = 0.5
+MAX_SCORE = 1.5
+
+
+def calculate_team_quality_from_data(seasons: int = QUALITY_SEASONS) -> Dict[str, float]:
     """
-    Calculate team quality scores from actual historical match data.
-    
+    Team quality scores from stored match results, keyed on canonical slug.
+
     Returns:
-        Dict mapping team names to quality scores (0.5 = worst, 1.5 = best)
+        Dict mapping team slug to a quality score in [0.5, 1.5], 1.0 being average.
     """
     log.info("Calculating team quality from historical match data...")
-    
-    # Load historical match data
-    matches = read_parquet(RAW / 'football-data' / 'EPL_all_matches.parquet')
-    
-    # Filter to recent seasons for relevance (2023-24, 2024-25)
-    # Don't include 2025-26 as it's only 1 game so far
-    recent_matches = matches[matches['season'].isin([2023, 2024])].copy()
-    
-    if len(recent_matches) == 0:
-        log.warning("No recent match data found, using fallback team quality")
-        return get_fallback_team_quality()
-    
-    log.info(f"Analyzing {len(recent_matches)} matches from {recent_matches['season'].nunique()} seasons")
-    
-    # Calculate team performance metrics
-    team_stats = {}
-    
-    # Get all unique teams
-    all_teams = set(recent_matches['home_team'].dropna()) | set(recent_matches['away_team'].dropna())
-    
-    for team in all_teams:
-        # Home matches
-        home_matches = recent_matches[recent_matches['home_team'] == team]
-        away_matches = recent_matches[recent_matches['away_team'] == team]
-        
-        if len(home_matches) == 0 and len(away_matches) == 0:
-            continue
-            
-        # Calculate points (3 for win, 1 for draw, 0 for loss)
-        home_points = 0
-        away_points = 0
-        total_games = 0
-        goals_for = 0
-        goals_against = 0
-        
-        # Home performance
-        for _, match in home_matches.iterrows():
-            home_goals = match['home_goals']
-            away_goals = match['away_goals']
-            
-            if pd.notna(home_goals) and pd.notna(away_goals):
-                goals_for += home_goals
-                goals_against += away_goals
-                total_games += 1
-                
-                if home_goals > away_goals:
-                    home_points += 3
-                elif home_goals == away_goals:
-                    home_points += 1
-        
-        # Away performance  
-        for _, match in away_matches.iterrows():
-            home_goals = match['home_goals'] 
-            away_goals = match['away_goals']
-            
-            if pd.notna(home_goals) and pd.notna(away_goals):
-                goals_for += away_goals
-                goals_against += home_goals
-                total_games += 1
-                
-                if away_goals > home_goals:
-                    away_points += 3
-                elif away_goals == home_goals:
-                    away_points += 1
-        
-        if total_games > 0:
-            points_per_game = (home_points + away_points) / total_games
-            goals_per_game = goals_for / total_games
-            goals_conceded_per_game = goals_against / total_games
-            goal_difference_per_game = goals_per_game - goals_conceded_per_game
-            
-            # Calculate composite quality score
-            # Weight: 50% points per game, 30% goal difference, 20% goals scored
-            quality_score = (
-                0.5 * (points_per_game / 3.0) +  # Normalize to 0-1 scale
-                0.3 * max(0, min(1, (goal_difference_per_game + 2) / 4)) +  # GD from -2 to +2 → 0-1
-                0.2 * min(1, goals_per_game / 3.0)  # Goals per game capped at 3
-            )
-            
-            team_stats[team] = {
-                'points_per_game': points_per_game,
-                'goals_per_game': goals_per_game,
-                'goals_conceded_per_game': goals_conceded_per_game,
-                'goal_difference_per_game': goal_difference_per_game,
-                'total_games': total_games,
-                'quality_score': quality_score
-            }
-    
-    # Normalize quality scores to 0.5-1.5 range
-    if team_stats:
-        scores = [stats['quality_score'] for stats in team_stats.values()]
-        min_score = min(scores)
-        max_score = max(scores)
-        
-        # Avoid division by zero
-        if max_score > min_score:
-            normalized_scores = {}
-            for team, stats in team_stats.items():
-                # Normalize to 0.5-1.5 range (0.5 = weakest, 1.0 = average, 1.5 = strongest)
-                normalized = 0.5 + (stats['quality_score'] - min_score) / (max_score - min_score)
-                normalized_scores[team] = normalized
-        else:
-            # All teams equal - set to 1.0 (average)
-            normalized_scores = {team: 1.0 for team in team_stats.keys()}
-    else:
-        normalized_scores = {}
-    
-    # Handle promoted teams (no PL history)
-    promoted_teams = {"Sunderland", "Burnley", "Leeds United"}
-    for team in promoted_teams:
-        if team not in normalized_scores:
-            normalized_scores[team] = 0.6  # Slightly below average for promoted teams
-    
-    # Log results
-    if normalized_scores:
-        sorted_teams = sorted(normalized_scores.items(), key=lambda x: x[1], reverse=True)
-        log.info("Team quality rankings (top 5):")
-        for team, score in sorted_teams[:5]:
-            points_pg = team_stats.get(team, {}).get('points_per_game', 0)
-            log.info(f"  {team}: {score:.3f} ({points_pg:.2f} pts/game)")
-        
-        log.info("Team quality rankings (bottom 5):")
-        for team, score in sorted_teams[-5:]:
-            points_pg = team_stats.get(team, {}).get('points_per_game', 0)
-            log.info(f"  {team}: {score:.3f} ({points_pg:.2f} pts/game)")
-    
-    # Save for caching
-    quality_df = pd.DataFrame([
-        {'team': team, 'quality_score': score, 'data_driven': True}
-        for team, score in normalized_scores.items()
-    ])
-    write_parquet(quality_df, PROC / 'team_quality.parquet')
-    
-    log.info(f"Calculated data-driven quality scores for {len(normalized_scores)} teams")
-    return normalized_scores
 
-
-def get_fallback_team_quality() -> Dict[str, float]:
-    """
-    Fallback team quality when historical data is unavailable.
-    Only use for promoted teams or emergency situations.
-    """
-    return {
-        # Promoted teams (no PL history)
-        "Sunderland": 0.6,
-        "Burnley": 0.6, 
-        "Leeds United": 0.6,
-        # Fallback average for any other unknown teams
-    }
-
-
-def get_team_quality_scores() -> Dict[str, float]:
-    """
-    Get team quality scores, calculating from data if needed.
-    
-    Returns:
-        Dict mapping team names to quality scores (0.5-1.5 range)
-    """
     try:
-        # Try to load cached scores
-        quality_file = PROC / 'team_quality.parquet'
-        if quality_file.exists():
-            quality_df = read_parquet(quality_file)
-            scores = dict(zip(quality_df['team'], quality_df['quality_score']))
-            log.info(f"Loaded cached team quality scores for {len(scores)} teams")
-            return scores
+        matches = read_parquet(RAW / "football-data" / "EPL_all_matches.parquet")
     except Exception as e:
-        log.warning(f"Could not load cached team quality: {e}")
-    
-    # Calculate fresh scores
+        log.warning("No stored matches to judge team quality (%s)", e)
+        return {}
+
+    if matches.empty or "season" not in matches.columns:
+        log.warning("Stored matches carry no season column; cannot judge team quality")
+        return {}
+
+    # Take the most recent completed seasons present, whatever they happen to be.
+    available = sorted(int(s) for s in matches["season"].dropna().unique())
+    completed = [s for s in available if s < current_season()]
+    use = completed[-seasons:] if completed else available[-seasons:]
+    recent = matches[matches["season"].isin(use)].copy()
+
+    if recent.empty:
+        log.warning("No matches in the selected seasons; cannot judge team quality")
+        return {}
+
+    if "home_slug" not in recent.columns:
+        recent["home_slug"] = recent["home_team"].map(canonical_team)
+    if "away_slug" not in recent.columns:
+        recent["away_slug"] = recent["away_team"].map(canonical_team)
+    recent = recent.dropna(subset=["home_goals", "away_goals"])
+
+    log.info(
+        "Analysing %d matches from %s",
+        len(recent),
+        ", ".join(str(s) for s in use),
+    )
+
+    # One row per team per match, so home and away are handled by the same arithmetic.
+    home = pd.DataFrame(
+        {
+            "slug": recent["home_slug"],
+            "gf": recent["home_goals"],
+            "ga": recent["away_goals"],
+        }
+    )
+    away = pd.DataFrame(
+        {
+            "slug": recent["away_slug"],
+            "gf": recent["away_goals"],
+            "ga": recent["home_goals"],
+        }
+    )
+    long = pd.concat([home, away], ignore_index=True).dropna(subset=["slug"])
+    long["points"] = (long.gf > long.ga) * 3 + (long.gf == long.ga) * 1
+
+    agg = long.groupby("slug").agg(
+        games=("points", "size"),
+        points_per_game=("points", "mean"),
+        goals_per_game=("gf", "mean"),
+        conceded_per_game=("ga", "mean"),
+    )
+    agg["gd_per_game"] = agg.goals_per_game - agg.conceded_per_game
+
+    # Composite: half points, a third goal difference, the rest goals scored.
+    agg["raw"] = (
+        0.5 * (agg.points_per_game / 3.0)
+        + 0.3 * ((agg.gd_per_game + 2).clip(0, 4) / 4)
+        + 0.2 * (agg.goals_per_game / 3.0).clip(upper=1.0)
+    )
+
+    lo, hi = agg.raw.min(), agg.raw.max()
+    if hi > lo:
+        agg["score"] = MIN_SCORE + (agg.raw - lo) / (hi - lo) * (MAX_SCORE - MIN_SCORE)
+    else:
+        agg["score"] = 1.0
+
+    scores = agg.score.to_dict()
+
+    # Clubs in the league now with no recent top-flight results are newly promoted. Give them
+    # the average of the bottom three rather than a fixed constant, so the figure tracks how
+    # weak the bottom of the table actually was.
+    promoted_score = float(agg.score.nsmallest(3).mean()) if len(agg) >= 3 else MIN_SCORE
+    for slug in _current_league_slugs():
+        if slug and slug not in scores:
+            scores[slug] = promoted_score
+            log.info("%s has no recent top-flight results; scored %.3f", slug, promoted_score)
+
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    log.info("Team quality, best: %s", ", ".join(f"{t} {s:.2f}" for t, s in ranked[:5]))
+    log.info("Team quality, worst: %s", ", ".join(f"{t} {s:.2f}" for t, s in ranked[-5:]))
+
+    write_parquet(
+        pd.DataFrame(
+            [
+                {"team": slug, "quality_score": score, "data_driven": True}
+                for slug, score in scores.items()
+            ]
+        ),
+        PROC / "team_quality.parquet",
+    )
+    log.info("Calculated quality scores for %d teams", len(scores))
+    return scores
+
+
+def _current_league_slugs() -> set[str]:
+    """Canonical slugs of the clubs in the league right now."""
+    try:
+        from .fpl_api import get_bootstrap
+        from .teams import bootstrap_team_slugs
+
+        return set(bootstrap_team_slugs(get_bootstrap()).values())
+    except Exception as e:
+        log.warning("Could not read the current league from the API: %s", e)
+        return set()
+
+
+def get_team_quality_scores(refresh: bool = False) -> Dict[str, float]:
+    """
+    Team quality scores, from cache unless `refresh` is set.
+
+    Returns:
+        Dict mapping team slug to a quality score in [0.5, 1.5].
+    """
+    if not refresh:
+        try:
+            path = PROC / "team_quality.parquet"
+            if path.exists():
+                df = read_parquet(path)
+                scores = dict(zip(df["team"], df["quality_score"]))
+                log.info("Loaded cached team quality scores for %d teams", len(scores))
+                return scores
+        except Exception as e:
+            log.warning("Could not load cached team quality: %s", e)
+
     return calculate_team_quality_from_data()
 
 
-def get_team_tier(team_name: str, quality_scores: Dict[str, float] = None) -> int:
+def get_team_tier(team_name: str, quality_scores: Dict[str, float] | None = None) -> int:
     """
-    Get team tier (0-3) based on data-driven quality scores.
-    
-    Args:
-        team_name: Name of the team
-        quality_scores: Optional pre-calculated scores
-        
+    Team tier from the data-driven quality score. Accepts any spelling of the club name.
+
     Returns:
-        Tier: 0 = promoted/weak, 1 = lower-mid, 2 = upper-mid, 3 = top tier
+        Tier: 0 = weak/promoted, 1 = lower-mid, 2 = upper-mid, 3 = top
     """
     if quality_scores is None:
         quality_scores = get_team_quality_scores()
-    
-    score = quality_scores.get(team_name, 1.0)  # Default to average
-    
-    # Convert quality score (0.5-1.5) to tier (0-3)
+
+    score = quality_scores.get(canonical_team(team_name))
+    if score is None:
+        # Also accept a dict that is still keyed on display names.
+        score = quality_scores.get(team_name, 1.0)
+
     if score >= 1.3:
-        return 3  # Top tier (equivalent to old "top 6")
-    elif score >= 1.1:
-        return 2  # Upper-mid table (equivalent to old "good teams") 
-    elif score >= 0.8:
-        return 1  # Lower-mid table
-    else:
-        return 0  # Weak/promoted teams
+        return 3
+    if score >= 1.1:
+        return 2
+    if score >= 0.8:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

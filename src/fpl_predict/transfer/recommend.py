@@ -39,6 +39,43 @@ def load_current_team(entry_id: Optional[int] = None) -> tuple[List[int], Dict[s
     return player_ids, transfer_info
 
 
+def ep_data_provenance() -> str:
+    """One-line summary of which EP model wrote exp_points.parquet and how stale it is.
+
+    exp_points.parquet carries no model tag of its own, and both the "component" (default,
+    better-backtested) and "shipped" (legacy) pipelines write to the same path — so running
+    `fpl update --run --model shipped` even once silently leaves worse-calibrated numbers in
+    place for every later command until someone happens to notice. Surfacing it here means a
+    mismatch shows up where it is actually consumed, not just in files nobody checks weekly.
+    """
+    from datetime import datetime, timezone
+
+    changelog_path = PROC / "weekly_changelog.json"
+    try:
+        with open(changelog_path) as f:
+            changelog = json.load(f)
+    except Exception:
+        return "  DATA: could not read weekly_changelog.json — run `fpl update --run` first."
+
+    model = changelog.get("ep_model", "unknown")
+    updated_at = changelog.get("updated_at", "unknown")
+    line = f"  EP data: '{model}' model, generated {updated_at}"
+
+    if model != "component":
+        line += "\n  WARNING: not the default model (measures worse in backtests) — run `fpl update --run` with no --model flag to regenerate."
+
+    try:
+        age = datetime.now(timezone.utc) - datetime.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        if age.total_seconds() > 24 * 3600:
+            line += f"\n  WARNING: data is {age.days}d old — run `fpl update --run` before trusting this."
+    except Exception:
+        pass
+
+    return line
+
+
 def match_transfers_by_position(transfers_out, transfers_in, bootstrap_data: Dict) -> List[Dict]:
     """
     Match transfers OUT and IN by position so each pair is the same position.
@@ -417,8 +454,9 @@ def recommend_weekly_transfers(
                 xmins_df = read_parquet(Path("data/processed/xmins.parquet"))
                 ep_map = dict(zip(ep_df['player_id'], ep_df['ep_adjusted']))
                 xmins_map = dict(zip(xmins_df['player_id'], xmins_df['xmins']))
-            except:
-                log.warning("Could not load predictions for banking logic")
+            except Exception as e:
+                log.warning(f"Could not load predictions for banking logic ({e}); "
+                            "unavailable-player detection will be skipped rather than guessed at")
                 ep_map = {}
                 xmins_map = {}
             
@@ -793,6 +831,7 @@ def format_recommendation_output(recommendation: Dict[str, Any]) -> str:
     output.append("=" * 60)
     output.append("FPL TRANSFER RECOMMENDATION")
     output.append("=" * 60)
+    output.append(ep_data_provenance())
 
     # --- SQUAD STATUS ---
     output.append("")

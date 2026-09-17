@@ -9,7 +9,7 @@ A comprehensive machine learning system for Fantasy Premier League predictions a
 - **Weekly Transfer Recommendations**: Analyzes your existing team and suggests optimal transfers with banking strategy comparison
 - **Fixture-Based EP Predictions**: Per-gameweek expected points using FDR and venue adjustments
 - **Free Hit Team Generator**: Builds optimal 15-man Free Hit squads with budget optimization and haul-factor captaincy
-- **Chip Strategy (2025/26)**: Plans optimal usage of 8 chips (2 sets) with fixture analysis and urgency tracking
+- **Chip Strategy**: Plans all 8 chips (2 sets of 4) using the availability windows the API reports
 - **Competition Detection**: Data-driven identification of backup players and rotation risks
 - **Recent Transfer Detection**: Web scraping to adjust for new signings
 - **New Player Adjustments**: Smart handling of players with limited data to avoid harsh penalties
@@ -22,23 +22,42 @@ A comprehensive machine learning system for Fantasy Premier League predictions a
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 cp .env.example .env
+```
 
-# Authenticate (get token from FPL DevTools)
-fpl auth set-token --token "Bearer YOUR_TOKEN_HERE"
+## Weekly workflow
 
-# Advanced workflow with ensemble models
-fpl update --run --advanced
+The whole sequence, in order. Timings are measured, not estimated.
+
+```bash
+# 1. Pull data and produce expected points for the next gameweek   (~2 min)
+fpl update --run
+
+# 2. Sync your squad. Needed by steps 3b and 4; token expires hourly.
+fpl auth set-token --token "Bearer YOUR_TOKEN"
+fpl myteam sync --entry YOUR_TEAM_ID
+
+# 3a. Build a squad from scratch: gameweek 1, a wildcard, or a free hit
 fpl transfers optimize --use-lp --horizon 5 --bench-budget 180
 
-# Get transfer recommendations for existing team
-fpl myteam sync --entry YOUR_TEAM_ID
-fpl transfers recommend --consider-hits
+# 3b. Or, mid-season, get transfers for the squad you already have
+fpl transfers recommend --horizon 5 [--consider-hits] [--max-transfers 2]
 
-# Chip strategy and Free Hit planning
-fpl chips plan-2025 --use-myteam              # See when to use chips
-fpl chips free-hit --gw 9                     # Generate optimal Free Hit team
-fpl chips free-hit-analysis                   # Compare all gameweeks
+# 4. Chip strategy
+fpl chips plan                                # all 8 chips, windows read from the API
+fpl chips free-hit --gw 9                     # a Free Hit XI for one gameweek
+fpl chips free-hit-analysis                   # compare gameweeks
 ```
+
+Step 1 is one command because pulling data and training are one pipeline: ingest results,
+refresh the gameweek archive, rebuild features and fixture difficulty, rebuild the panel, fit
+the model, predict the upcoming gameweek, then apply squad-role and availability adjustments.
+
+`--model shipped` reverts step 1 to the original expected-points model. It measures 34.3% XI
+capture against the default's ~42%, so it exists for comparison rather than use.
+
+**Sync before step 3b or 4.** FPL renumbers player ids every summer, so a `myteam_latest.json`
+from last season resolves to entirely different players and the output is confident nonsense
+rather than an error.
 
 ## Installation
 
@@ -79,15 +98,13 @@ Updates FPL data and optionally trains models.
 
 Options:
 - `--run`: Actually run the update (otherwise just shows what would happen)
-- `--advanced`: Use XGBoost/LightGBM ensemble models instead of basic models
-- `--rebuild-features`: Force rebuild feature engineering
-- `--rebuild-models`: Force retrain all models
+- `--demo`: Use bundled sample data only, skipping live ingestion
+- `--model {component,shipped}`: Expected-points model (default `component`; measures better in backtests, see `fpl backtest`)
 
 Examples:
 ```bash
-fpl update --run                    # Basic update and training
-fpl update --run --advanced         # Use advanced models
-fpl update --run --rebuild-models   # Force retrain everything
+fpl update --run                    # Update and train with the default (component) model
+fpl update --run --model shipped    # Use the legacy model instead
 ```
 
 ### Transfer Commands
@@ -155,12 +172,12 @@ fpl myteam prices    # Check if any players changed price
 
 ### Chip Strategy Commands
 
-#### `fpl chips plan-2025`
-Plans optimal chip usage for 2025/26 season with double chips system (8 total chips).
+#### `fpl chips plan`
+Plans all 8 chips (2 sets of 4, one per half of the season).
 
 Features:
-- **H1 Planning (GW1-19)**: Use-it-or-lose-it chips with urgency tracking
-- **H2 Planning (GW20-38)**: DGW/BGW predictions for optimal timing
+- **H1 Planning**: Use-it-or-lose-it chips with urgency tracking, windows read from the API
+- **H2 Planning**: DGW/BGW predictions for optimal timing
 - **Fixture-Based Analysis**: Per-gameweek EP predictions using FDR and venue
 - **Personalized Recommendations**: Based on your actual squad
 - **Haul Factor Captaincy**: Prioritizes high-ceiling players for Triple Captain
@@ -172,9 +189,9 @@ Options:
 
 Examples:
 ```bash
-fpl chips plan-2025                        # General chip strategy
-fpl chips plan-2025 --use-myteam           # Personalized for your team
-fpl chips plan-2025 --show-teams           # Include Free Hit team previews
+fpl chips plan                             # General chip strategy
+fpl chips plan --use-myteam                # Personalized for your team
+fpl chips plan --show-teams                # Include Free Hit team previews
 ```
 
 #### `fpl chips free-hit`
@@ -208,7 +225,7 @@ Features:
 
 Options:
 - `--gw-start N`: Starting gameweek (default: current GW)
-- `--gw-end N`: Ending gameweek (default: 19)
+- `--gw-end N`: Ending gameweek (default: the H1 chip deadline from the API)
 
 Examples:
 ```bash
@@ -244,20 +261,38 @@ fpl auth test --entry 5436936    # Test with specific team ID
 
 ### 1. Data Sources & Ingestion
 
-The system ingests data from multiple sources:
+| Source | What it gives | Where it lands |
+|:-------|:--------------|:---------------|
+| FPL API `bootstrap-static` | prices, ownership, status, scoring rules, chip windows | in memory, cached per run |
+| FPL API `element-summary` | per-gameweek history for the current season, previous-season totals | `data/processed/features.parquet` |
+| FPL API `fixtures` | fixture list, results once played | `data/raw/football-data/EPL_<season>_matches.parquet` |
+| `vaastav/Fantasy-Premier-League` | per-player-per-gameweek history, 2022-23 onward | `data/raw/fpl_history/<season>/player_gw.parquet` |
+| football-data.org | match results, fallback when the archive is unavailable | `data/raw/football-data/` |
+| Web scraping | mid-season transfer news | applied as xMins adjustments |
 
-- **FPL API** (`bootstrap-static`): Player stats, fixtures, teams
-  - Current season player data (prices, ownership, form)
-  - Fixture list with home/away teams
-  - Team metadata and strength ratings
+The gameweek archive is the training set: 113,260 player-gameweek rows across four seasons,
+with xG, xA and xGC from 2022-23 and the defensive-contribution components from 2025-26 (the
+season the rule was introduced). Rows are keyed on FPL's stable player `code`, because
+element ids are renumbered every summer. It also carries `xP`, FPL's own pre-deadline
+expected points, which is the baseline any model here has to beat.
 
-- **Football-Data.org**: Historical match results
-  - Past match scores and statistics
-  - Used for team strength calculations
+**Season handling.** `config.current_season()` flips in July, so nothing is pinned to a
+season number. Completed seasons are cached and reused; only the season in progress is
+re-pulled. A fetch that returns nothing leaves the stored file alone, which matters in
+August: the new season has no finished fixtures, and an earlier version rebuilt the combined
+match file from that empty result and dropped a whole season of history.
 
-- **Web Scraping**: Recent transfer detection
-  - Scrapes Premier League, Sky Sports, BBC for transfers
-  - Applies time-based penalties to newly transferred players
+**Team names.** Every source spells clubs differently ("Manchester City FC", "Man City",
+"Man Utd", "Man United"), so `data/teams.py` maps all of them onto one slug. Eight of twenty
+clubs used to resolve to two different keys depending on the source, which broke every join
+keyed on team name: Elo ratings, clean-sheet rates, team form and team quality were all
+computed under one spelling and looked up under another.
+
+- **Scoring rules** come from `bootstrap-static.game_config.scoring`, not from scraping the
+  help page, so a rule change is picked up on the next run. 2026/27 raised goalkeeper goals
+  from 6 to 10 points. The only values not in the API are the defensive-contribution
+  thresholds (10 CBIT for defenders, 12 CBIRT for midfielders and forwards), which are
+  scraped with those constants as the fallback.
 
 ### 2. Preprocessing Pipeline
 
@@ -278,16 +313,10 @@ Data flows through several preprocessing steps:
 
 ### 3. Model Training
 
-The system trains multiple specialized models:
+`fpl update --model {component,shipped}` selects which expected-points model runs (default `component`):
 
-#### Basic Models (default):
-- **Linear Regression**: Simple baseline predictions
-- **Random Forest**: Non-linear patterns
-
-#### Advanced Models (`--advanced` flag):
-- **XGBoost**: Gradient boosting for complex patterns
-- **LightGBM**: Fast gradient boosting
-- **Ensemble**: Weighted average of multiple models
+- **`component`**: per-component LightGBM models (minutes band, goals, assists, bonus, cards, clean sheets, goals conceded, saves, defensive contribution), combined into a single expected-points figure. Measures 39.5% XI capture over 151 backtested gameweeks.
+- **`shipped`**: the original Poisson-rate pipeline, blended with FPL's own `ep_next`. Measures 34.3% XI capture over the same backtest — kept for comparison, not recommended for regular use.
 
 #### Prediction Targets:
 - **Expected Points (EP)**: Total points prediction
@@ -321,10 +350,10 @@ After training, several adjustments are applied:
 
 3. **Recent Transfer Adjustments** (`recent_transfers.py`):
    - Web scrapes for transfers in last 14 days
-   - Applies penalties:
-     - 0-3 days: 80% of original xMins
-     - 4-7 days: 65% of original xMins
-     - 8-14 days: 40% of original xMins
+   - Applies penalties (eased over time as the player settles in):
+     - 0-3 days: 20% of original xMins
+     - 4-7 days: 35% of original xMins
+     - 8-14 days: 60% of original xMins
 
 4. **New Player Adjustments** (`adjustments.py`):
    - Prevents harsh penalties for players with limited minutes (<180 mins)
@@ -371,10 +400,141 @@ Running `fpl update --run` triggers the complete pipeline, ensuring all fixes an
 
 ## Model Performance
 
-The system uses cross-validation to evaluate models:
-- Expected Points: MAE ~2.5 points
-- Minutes Prediction: Accuracy ~85% for starters
-- Clean Sheets: AUC-ROC ~0.72
+Measured, at last, by `fpl backtest`. Rolling origin over the gameweek archive: walk forward
+one gameweek at a time, train only on what came before, score against what actually happened.
+151 gameweeks across 2022-23 to 2025-26.
+
+| Predictor | Spearman | XI points | XI capture | MAE |
+|:----------|---------:|----------:|-----------:|----:|
+| component model | 0.695 | 54.9 | 39.8% | 1.03 |
+| direct GBM | 0.691 | 52.0 | 37.8% | 1.05 |
+| **shipped design** | 0.592 | 46.9 | 34.3% | 1.43 |
+| mean points, last 5 | 0.684 | 46.3 | 33.9% | 1.09 |
+| position mean | 0.096 | 11.9 | 8.8% | 1.56 |
+
+**XI points** is the number that matters: what the best legal XI implied by each ranking
+actually scored. MAE is reported but is a poor guide, because two thirds of the selection
+universe scores 0-2 and "everyone gets 2" scores well on it while being useless for picking a
+team.
+
+### Read XI capture against the right ceiling
+
+The percentage looks low, and it is easy to read 39.8% as "the model is 40% of the way to
+good". It is not. The denominator is a perfect-hindsight XI, which knows which centre-back
+scored a 90th-minute header and is unreachable by anything. The useful reference points:
+
+| Reference | XI points | % of oracle |
+|:----------|----------:|------------:|
+| perfect hindsight (oracle) | 137.2 | 100% |
+| knows every player's true season scoring rate | 60.3 | 44.0% |
+| **the same, blind to this gameweek's outcome** | **54.8** | **39.9%** |
+| **component model** | **54.9** | **40.0%** |
+| shipped design | 46.9 | 34.2% |
+| pick the most expensive legal XI | 45.7 | 33.3% |
+| random legal XI of plausible starters | 31.6 | 23.0% |
+| an XI of league-average players | 12.9 | 9.4% |
+
+The third row is the one to compare against: a forecaster with perfect knowledge of every
+player's underlying quality but no sight of this particular gameweek. It scores 54.8. So
+**39.8% is roughly what perfect knowledge of player quality gets you**, and the floor is 23%
+rather than 0%.
+
+Three things follow:
+
+- **The shipped design barely beats picking by price.** 46.9 against 45.7 for the most
+  expensive legal XI, with no model at all. It is also indistinguishable from averaging the
+  last five gameweeks (46.3), and its rank correlation is *worse* than that naive rule.
+- **The component model is a real improvement**: +8.0 XI points per gameweek over the shipped
+  design, better in 66.9% of gameweeks, consistent across all four seasons.
+- **The remaining headroom is not in player quality.** The component model already sits at the
+  quality-knowledge reference, so anything further has to come from information that reference
+  lacks: fixtures, venue, availability, doubles, rotation.
+
+### Is the fixture information being used?
+
+Yes, mostly. The effects are real and measurable in the data, within-player over 30,682
+appearances of 60+ minutes:
+
+| Effect | In the data | Model captures |
+|:-------|------------:|---------------:|
+| Home advantage | +0.363 pts (t = 10.5) | 76% |
+| Easiest minus hardest opponent | +0.706 pts | 73% |
+| Clean sheet rate, easiest vs hardest opponent | 28.0% vs 21.1% | — |
+| Goals, easiest vs hardest opponent | 0.244 vs 0.166 | — |
+
+"Model captures" comes from perturbing one context feature at a time on real rows and
+measuring how far the prediction moves. Where that signal lands is uneven:
+
+| Sub-model | Share of its gain from fixture context | Leading features |
+|:----------|---------------------------------------:|:-----------------|
+| clean sheet | 72.5% | team_gf_l10, opp_gf_l10, team_ga_l10 |
+| goals conceded | 69.1% | opp_gf_l10, team_gf_l10, team_ga_l10 |
+| saves | 29.4% | opp_gf_l10, selected, xgc_l5 |
+| assists | 14.9% | **value**, xa_per90_l10 |
+| bonus | 13.7% | selected, value, bps_l5 |
+| goals | 12.2% | **value**, xg_per90_l10 |
+| minutes band | 3.6% | mins_l3, mins_std_l5 |
+
+Three things worth knowing:
+
+- The **defensive** components are strongly fixture-aware; the **attacking** ones barely are.
+- The goals and assists models lean on **price** more than on expected-goals rate. Price is an
+  effective proxy for quality, but it means part of the model is "expensive players score".
+- Venue effects are position-dependent and unevenly learned: measured home advantage is +0.672
+  for forwards and the model captures only 49% of it, while for goalkeepers it over-reads
+  (+0.206 modelled against +0.129 measured).
+
+**Why this barely moves XI capture**: a fixture-adjusted top eleven overlaps ~75% with a
+quality-only top eleven, so even perfect fixture modelling can reorder about three of eleven
+players. Use MAE and Spearman to judge these features, not XI points. `fpl backtest --ablate`
+refits with each feature family withheld and reports all three.
+
+The previously quoted figures here (MAE ~2.5, 85% minutes accuracy, CS AUC 0.72) were never
+produced by any code in this repo. `models/backtest.py` returned hardcoded constants and
+nothing called it.
+
+### A trap worth knowing about
+
+The archive carries an `xP` column that looks like FPL's pre-deadline expected points and is
+the obvious baseline. **It is contaminated with post-match information.** Run
+`fpl backtest --leakage-check`:
+
+| Check | `fpl_xp` | Best lagged feature |
+|:------|---------:|--------------------:|
+| Correlation with this gameweek's points, players who did play | 0.613 | 0.187 |
+| Correlation with this gameweek's *bonus* | 0.434 | — |
+| AUC for whether an established starter played at all | 0.826 | 0.615 |
+
+Nothing predicts a single match's bonus points at 0.43 — bonus is decided inside the match.
+Used as a baseline it looks unbeatable at 65% XI capture, which is what makes it dangerous.
+This says nothing about the live API's `ep_next`, a genuine forward-looking figure that simply
+cannot be evaluated historically because past values are not recoverable.
+
+### What the shipped design gets wrong
+
+Measured over 45,787 appearances under the current scoring table:
+
+| Component | Modelled | Actual (mean pts/appearance) |
+|:----------|:---------|:-----------------------------|
+| Saves | no | 0.66 for GKP, 17% of their points |
+| Goals conceded | no | -0.50 GKP, -0.40 DEF |
+| Bonus | no | 0.17-0.36, strongest predictor of a score after goals |
+| Cards | no | -0.07 to -0.17 |
+| Defensive contribution | over-credited | 3x DEF, 4.5x MID, 69x FWD |
+
+The defensive-contribution formula is `min(rate / threshold, 0.8)`, which treats a player
+averaging the threshold as near-certain to clear it. The real hit rate at that average is
+about 50%, and across all appearances it is 21% DEF, 11% MID, 1% FWD. Net effect: expected
+points over-rate defenders by roughly 68% and under-rate goalkeepers by roughly 20%.
+
+The component model addresses all of these, which is where its +7.7 points come from.
+
+```bash
+fpl backtest                          # score every predictor
+fpl backtest --by-season              # check stability across seasons
+fpl backtest --leakage-check          # the xP evidence above
+fpl backtest --refresh-history         # re-pull the archive, rebuild the panel, then score
+```
 
 ## Recent Updates
 
@@ -387,7 +547,7 @@ The system uses cross-validation to evaluate models:
 - **Fixture Analysis**: Compare Free Hit value across all gameweeks with EP deltas
 
 ### Chip Strategy Improvements
-- **2025/26 Double Chips**: Plans optimal usage of 8 chips (2 sets of TC/BB/FH/WC)
+- **Double Chips**: Plans all 8 chips (2 sets of TC/BB/FH/WC)
 - **Fixture-Based EP**: Per-gameweek predictions using FDR and home/away adjustments
 - **Urgency Tracking**: H1 chips (GW1-19) have deadline pressure, H2 saved for DGWs
 - **FDR Bug Fix**: Corrected inverted FDR multiplier (low FDR now correctly = easier fixture)
@@ -419,11 +579,10 @@ FPL_AUTH_TOKEN=your_token_here    # From browser DevTools
 FPL_ENTRY_ID=5436936              # Your team ID
 FPL_EMAIL=your_email              # For password login
 FPL_PASSWORD=your_password        # For password login
-FOOTBALL_DATA_TOKEN=api_token     # For historical data
-
-# Behavior toggles
-ALLOW_RULES_FALLBACK=true        # Use rule-based models as fallback
-ALLOW_ODDS_FALLBACK=true         # Use odds data if available
+FOOTBALL_DATA_TOKEN=api_token     # For historical data (football-data.org); falls back to a CSV source if unset
+FD_START_SEASON=2023               # First historical season to ingest, e.g. 2023 = 2023/24 (defaults to a rolling window)
+FD_END_SEASON=2024                 # Last *completed* season to ingest; always advances to last season regardless of this value
+HISTORY_SEASONS=5                  # How many completed seasons to ingest when the window above is not pinned
 ```
 
 ## Troubleshooting
@@ -464,7 +623,7 @@ MIT License - see LICENSE file for details
 |:-------------------------------------------|:-------------|
 | Minutes 1-59                               | 1            |
 | Minutes 60+                                | 2            |
-| Goal (GKP)                                 | 6            |
+| Goal (GKP)                                 | 10           |
 | Goal (DEF)                                 | 6            |
 | Goal (MID)                                 | 5            |
 | Goal (FWD)                                 | 4            |

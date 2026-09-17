@@ -2,7 +2,6 @@
 Handle player availability based on injury status, suspensions, and transfers.
 """
 import pandas as pd
-import numpy as np
 from typing import Dict, Any
 from ..utils.logging import get_logger
 
@@ -135,34 +134,5 @@ def apply_availability_adjustments(
                 log.debug(f"Reduced predictions for player {player_id} by {(1-multiplier)*100:.0f}% (chance={chance})")
     
     log.info(f"Availability adjustments: {zeroed_count} players zeroed, {adjusted_count} players reduced")
-    
+
     return adjusted
-
-
-def check_player_availability(player_id: int, bootstrap_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Check detailed availability status for a specific player.
-    
-    Args:
-        player_id: FPL player ID
-        bootstrap_data: FPL bootstrap data
-        
-    Returns:
-        Dictionary with availability details
-    """
-    for player in bootstrap_data['elements']:
-        if player['id'] == player_id:
-            return {
-                'id': player_id,
-                'name': player['web_name'],
-                'status': player.get('status', 'a'),
-                'chance': player.get('chance_of_playing_this_round'),
-                'news': player.get('news', ''),
-                'is_available': player.get('status') == 'a',
-                'should_zero': (
-                    player.get('status') in ['s', 'u'] or
-                    (player.get('status') == 'i' and player.get('chance_of_playing_this_round', 100) == 0)
-                )
-            }
-    
-    return None

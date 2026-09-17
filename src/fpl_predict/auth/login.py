@@ -7,8 +7,10 @@ from ..utils.logging import get_logger
 
 log = get_logger(__name__)
 
-# Load .env file on module import
-load_dotenv()
+# override=True: this module's whole job is reading credentials this project's own commands
+# (set_token_env, set_cookie_env, pw_login) just wrote to .env — a stale value already sitting
+# in the shell environment (.envrc/direnv, or a leftover manual export) must not shadow it.
+load_dotenv(override=True)
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) "
@@ -58,34 +60,52 @@ def set_cookie_env(cookie: str, save_env_path: Optional[str] = ".env") -> None:
     log.info("Saved FPL_SESSION%s", f" to {save_env_path}" if save_env_path else "")
 
 
-def get_auth_headers() -> dict[str, str]:
+def get_auth_header_candidates() -> list[dict[str, str]]:
+    """Every configured auth header set, token first then cookie.
+
+    Presence of a token doesn't mean it's still valid — FPL bearer tokens expire in
+    around an hour (see README) — so a caller making a real request should try each
+    candidate in order and fall back to the next on a 401/403 rather than trusting
+    the first one blindly.
     """
-    Prefer token auth (x-api-authorization: Bearer <token>).
-    Fallback to cookie auth (Cookie: <FPL_SESSION>).
-    """
+    # Referer/X-Api-Language mirror what the site's own frontend actually sends alongside
+    # this header (checked directly against a real browser request) — some APIs gate on
+    # Referer/Origin as a lightweight CSRF/bot check, which a bare Bearer header wouldn't
+    # satisfy on its own.
+    common = {
+        "User-Agent": UA,
+        "accept-language": "en",
+        "Referer": "https://fantasy.premierleague.com/",
+        "X-Api-Language": "en",
+    }
+
+    candidates = []
     token = _env("FPL_AUTH_TOKEN")
     if token:
-        return {
-            "User-Agent": UA,
-            "accept-language": "en",
-            "x-api-authorization": f"Bearer {token}",
-        }
+        candidates.append({**common, "x-api-authorization": f"Bearer {token}"})
 
     cookie = _env("FPL_SESSION")
     if cookie:
-        return {
-            "User-Agent": UA,
-            "accept-language": "en",
-            "Cookie": cookie,
-        }
+        candidates.append({**common, "Cookie": cookie})
 
-    raise RuntimeError(
-        "No auth configured. Set FPL_AUTH_TOKEN (preferred) or FPL_SESSION in your environment or .env.\n"
-        "Tip: Copy the whole 'Cookie' OR the 'x-api-authorization: Bearer …' value from DevTools and run:\n"
-        "  fpl auth set-token  (for Bearer)\n"
-        "  or\n"
-        "  fpl auth set-cookie (for Cookie)"
-    )
+    if not candidates:
+        raise RuntimeError(
+            "No auth configured. Set FPL_AUTH_TOKEN (preferred) or FPL_SESSION in your environment or .env.\n"
+            "Tip: Copy the whole 'Cookie' OR the 'x-api-authorization: Bearer …' value from DevTools and run:\n"
+            "  fpl auth set-token  (for Bearer)\n"
+            "  or\n"
+            "  fpl auth set-cookie (for Cookie)"
+        )
+    return candidates
+
+
+def get_auth_headers() -> dict[str, str]:
+    """The single preferred auth header set (token if set, else cookie).
+
+    For a real request that can retry on failure, prefer get_auth_header_candidates()
+    and fall back through the list on a 401/403 instead of trusting this blindly.
+    """
+    return get_auth_header_candidates()[0]
 
 
 def pw_login(email: str, password: str, save_env_path: Optional[str] = ".env") -> str:
@@ -138,8 +158,14 @@ def pw_login(email: str, password: str, save_env_path: Optional[str] = ".env") -
             if cookie.name in important_cookies:
                 found_cookies[cookie.name] = True
         
+        # A failed login (wrong password) typically still returns HTTP 200 with the
+        # login form re-rendered, and still sets a csrftoken cookie for that page —
+        # so "we got some cookies" is not proof of a successful login. Only an actual
+        # authenticated-session cookie (pl_profile or sessionid) proves it worked.
+        authenticated = found_cookies["pl_profile"] or found_cookies["sessionid"]
+
         # Build cookie string
-        if all_cookies:
+        if all_cookies and authenticated:
             cookie_str = "; ".join(all_cookies)
             log.info(f"Received {len(all_cookies)} cookies")
             log.info(f"Important cookies found: {found_cookies}")
@@ -168,8 +194,14 @@ def pw_login(email: str, password: str, save_env_path: Optional[str] = ".env") -
                 log.debug(f"Could not fetch entry ID: {e}")
             
             return cookie_str
-        else:
+        elif not all_cookies:
             raise RuntimeError("Login failed - no cookies received. Check email/password.")
+        else:
+            log.error(f"Login did not authenticate (status={response.status_code}, cookies found: {found_cookies})")
+            raise RuntimeError(
+                "Login failed - received cookies but no authenticated session (pl_profile/sessionid). "
+                "Check email/password."
+            )
         
     except requests.RequestException as e:
         log.error(f"Network error during login: {e}")

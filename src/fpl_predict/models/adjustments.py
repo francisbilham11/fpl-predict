@@ -3,7 +3,6 @@ Adjustments for model predictions to handle edge cases.
 """
 import pandas as pd
 import numpy as np
-from typing import Optional
 from ..utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -119,65 +118,5 @@ def apply_new_player_adjustments(
             log.info(f"  {adj['player']} ({adj['position']}, £{adj['price']:.1f}m): "
                     f"{adj['original']:.2f} -> {adj['adjusted']:.2f} pts/game "
                     f"(benchmark: {adj['benchmark']:.2f}, mins: {adj['minutes']})")
-    
-    return adjusted
-
-
-def apply_rotation_risk_adjustments(
-    predictions_df: pd.DataFrame,
-    features_df: pd.DataFrame,
-    early_sub_threshold: int = 65,  # Minutes threshold for early sub
-    harsh_penalty_cap: float = 0.7,  # Don't reduce predictions by more than 30%
-) -> pd.DataFrame:
-    """
-    Adjust for rotation risk without being overly harsh on tactical substitutions.
-    
-    Players subbed at 59-65 minutes are often tactical (preserving for next match)
-    rather than performance-based, and shouldn't be heavily penalized.
-    
-    Args:
-        predictions_df: DataFrame with model predictions
-        features_df: DataFrame with player features  
-        early_sub_threshold: Minutes below which we consider it an early sub
-        harsh_penalty_cap: Maximum reduction factor (0.7 = max 30% reduction)
-    
-    Returns:
-        Adjusted predictions DataFrame
-    """
-    adjusted = predictions_df.copy()
-    
-    # Check recent minutes patterns
-    if 'mins_l3' in features_df.columns and 'starts_l3' in features_df.columns:
-        for idx, row in features_df.iterrows():
-            mins_l3 = row.get('mins_l3', 0)
-            starts_l3 = row.get('starts_l3', 0)
-            
-            # Check if player is being subbed early consistently
-            if starts_l3 > 0:
-                avg_mins_when_started = mins_l3 / starts_l3
-                
-                # If consistently subbed around 60 mins, it's likely tactical
-                if 55 <= avg_mins_when_started <= early_sub_threshold:
-                    # Don't apply harsh penalty - they're still starting
-                    player_id = row.get('id') or row.get('player_id')
-                    
-                    # Find corresponding prediction row
-                    pred_idx = adjusted[
-                        (adjusted.get('id') == player_id) | 
-                        (adjusted.get('player_id') == player_id)
-                    ].index
-                    
-                    if len(pred_idx) > 0:
-                        pred_idx = pred_idx[0]
-                        # Check if predictions are too low
-                        for col in adjusted.columns:
-                            if col.startswith('EP') or col == 'EPH':
-                                current_val = adjusted.at[pred_idx, col]
-                                if pd.notna(current_val):
-                                    # If tactical sub pattern, ensure reasonable floor
-                                    # 60 mins should still get ~70-80% of full game points
-                                    min_acceptable = current_val / harsh_penalty_cap
-                                    if current_val < min_acceptable:
-                                        adjusted.at[pred_idx, col] = min_acceptable
     
     return adjusted
