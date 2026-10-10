@@ -1922,8 +1922,30 @@ def optimize_with_lp(
                 log.warning(f"myteam file not found at {myteam_file}, using default budget")
                 budget_limit = BUDGET
         else:
-            # For new squads (no current_squad), use standard budget
-            budget_limit = BUDGET
+            # New squad, no --use-myteam/--wildcard passed: still prefer the real selling
+            # value + bank from a synced team over the flat £100m, so a squad built without
+            # those flags doesn't ignore a team whose value has actually dropped. Falls back
+            # to BUDGET only when there's no synced team to read.
+            import json
+            import os
+
+            myteam_file = "data/processed/myteam_latest.json"
+            if os.path.exists(myteam_file):
+                with open(myteam_file) as f:
+                    myteam_data = json.load(f)
+                selling_value = sum(
+                    pick.get("selling_price", pick.get("purchase_price", 0))
+                    for pick in myteam_data.get("picks", [])
+                )
+                bank = myteam_data.get("transfers", {}).get("bank", 0)
+                budget_limit = selling_value + bank
+                log.info(
+                    f"No --use-myteam/--wildcard, but a synced team exists: budget = "
+                    f"£{budget_limit / 10:.1f}m (selling value £{selling_value / 10:.1f}m + "
+                    f"bank £{bank / 10:.1f}m)."
+                )
+            else:
+                budget_limit = BUDGET
 
         prob += pulp.lpSum([squad_vars[p.id] * p.cost for p in players]) <= budget_limit
 
